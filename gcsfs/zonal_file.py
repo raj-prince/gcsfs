@@ -1,4 +1,5 @@
 import logging
+import os
 
 from fsspec import asyn
 from google.cloud.storage.asyncio.async_appendable_object_writer import (
@@ -68,19 +69,46 @@ class ZonalFile(GCSFile):
         self.flush_interval_bytes = flush_interval_bytes
         self.gcsfs = gcsfs
         self.pool_size = pool_size
+
+        dummy_io = kwargs.pop("dummy_io", None)
+        self.dummy_io = (
+            bool(dummy_io)
+            if dummy_io is not None
+            else bool(getattr(gcsfs, "dummy_io", False) is True)
+        )
+        if os.environ.get("GCSFS_DUMMY_IO", "0").lower() in ("1", "true"):
+            self.dummy_io = True
+
         object_size = None
         if "r" in self.mode:
-            self.mrd_pool = asyn.sync(
-                self.gcsfs.loop,
-                self.gcsfs._mrd_pool_cache.get,
-                bucket,
-                key,
-                generation,
-                self.pool_size,
-            )
-            if getattr(self.mrd_pool, "details", None) is not None:
-                self._details = self.mrd_pool.details
-            object_size = self.mrd_pool.persisted_size
+            if self.dummy_io:
+                class _DummyMRDPool:
+                    details = {"size": kwargs.get("size", 0)}
+                    persisted_size = kwargs.get("size")
+                    async def close(self):
+                        pass
+                self.mrd_pool = _DummyMRDPool()
+                object_size = self.mrd_pool.persisted_size
+                if object_size is None:
+                    try:
+                        info = asyn.sync(self.gcsfs.loop, self.gcsfs._info, path)
+                        object_size = info.get("size")
+                        self.mrd_pool.persisted_size = object_size
+                        self.mrd_pool.details = info
+                    except Exception:
+                        object_size = 0
+            else:
+                self.mrd_pool = asyn.sync(
+                    self.gcsfs.loop,
+                    self.gcsfs._mrd_pool_cache.get,
+                    bucket,
+                    key,
+                    generation,
+                    self.pool_size,
+                )
+                if getattr(self.mrd_pool, "details", None) is not None:
+                    self._details = self.mrd_pool.details
+                object_size = self.mrd_pool.persisted_size
 
             if object_size is None:
                 logger.warning(
@@ -94,6 +122,7 @@ class ZonalFile(GCSFile):
                 "Only read, write and append operations are currently supported for Zonal buckets."
             )
 
+        size_arg = kwargs.pop("size", object_size)
         super().__init__(
             gcsfs,
             path,
@@ -113,7 +142,7 @@ class ZonalFile(GCSFile):
             # Zonal buckets support append; this prevents GCSFile from forcing 'w' mode
             _supports_append="a" in mode,
             # pass persisted_size here so that Cache is initialized with correct object size
-            size=object_size,
+            size=size_arg,
             **kwargs,
         )
 

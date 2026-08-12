@@ -325,6 +325,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         endpoint_url=None,
         default_location=None,
         version_aware=False,
+        dummy_io=False,
         **kwargs,
     ):
         if cache_timeout is not None:
@@ -334,6 +335,10 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             asynchronous=asynchronous,
             loop=loop,
             **kwargs,
+        )
+        self.dummy_io = dummy_io or os.environ.get("GCSFS_DUMMY_IO", "0").lower() in (
+            "1",
+            "true",
         )
         if access not in self.scopes:
             raise ValueError(f"access must be one of {self.scopes}")
@@ -1206,6 +1211,19 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         # for start=5, end=5), causing the server to return the whole file instead of nothing.
         if start is not None and end is not None and start >= end >= 0:
             return b""
+
+        if getattr(self, "dummy_io", False) or os.environ.get(
+            "GCSFS_DUMMY_IO", "0"
+        ).lower() in ("1", "true"):
+            if start is None and end is None:
+                end = (await self._info(path))["size"]
+                start = 0
+            elif start is None:
+                start = 0
+            elif end is None:
+                end = (await self._info(path))["size"]
+            size = max(0, end - start)
+            return b"\x00" * size
 
         u2 = self.url(path, generation=kwargs.get("generation"))
         if start is not None or end is not None:
@@ -2393,6 +2411,15 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         self.acl = acl
         self.consistency = consistency
         self.checker = get_consistency_checker(consistency)
+
+        dummy_io = kwargs.pop("dummy_io", None)
+        self.dummy_io = (
+            bool(dummy_io)
+            if dummy_io is not None
+            else bool(getattr(gcsfs, "dummy_io", False) is True)
+        )
+        if os.environ.get("GCSFS_DUMMY_IO", "0").lower() in ("1", "true"):
+            self.dummy_io = True
 
         # Ideally, all of these fields should be part of `cache_options`. Because current
         # `fsspec` caches do not accept arbitrary `*args` and `**kwargs`, passing them

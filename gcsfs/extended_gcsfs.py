@@ -497,6 +497,11 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
 
     async def _concurrent_mrd_fetch(self, offset, length, concurrency, mrd_or_pool):
         """Helper to handle concurrent chunk downloads cleanly."""
+        if getattr(self, "dummy_io", False) or os.environ.get(
+            "GCSFS_DUMMY_IO", "0"
+        ).lower() in ("1", "true"):
+            return b"\x00" * length
+
         ranges = split_range(length, concurrency, self.MIN_CHUNK_SIZE_FOR_CONCURRENCY)
 
         tasks = []
@@ -581,6 +586,24 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             bytes: The content of the file or file range.
         """
         pool_created_here = False
+
+        if getattr(self, "dummy_io", False) or os.environ.get(
+            "GCSFS_DUMMY_IO", "0"
+        ).lower() in ("1", "true"):
+            try:
+                file_size = kwargs.get("size")
+                if file_size is None and mrd is not None:
+                    file_size = getattr(mrd, "persisted_size", None)
+                if file_size is None:
+                    file_size = (await self._info(path))["size"]
+            except Exception:
+                file_size = None
+            offset, length = await self._process_limits_to_offset_and_length(
+                path, start, end, file_size
+            )
+            return await self._concurrent_mrd_fetch(
+                offset, length, concurrency, mrd_or_pool=None
+            )
 
         # A new MRDPool is required when read is done directly by the
         # GCSFilesystem class without creating a GCSFile object first.
