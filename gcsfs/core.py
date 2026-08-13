@@ -2437,15 +2437,31 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
 
         if "r" in mode and use_prefetch_reader:
             max_prefetch_size = kwargs.get("max_prefetch_size", MAX_PREFETCH_SIZE)
-            from .prefetcher import BackgroundPrefetcher
+            use_slab = kwargs.get("use_slab_prefetcher", False) or os.environ.get(
+                "GCSFS_USE_SLAB_PREFETCHER", "0"
+            ).lower() in ("1", "true")
+            if use_slab:
+                from .slab_prefetcher import ZeroCopySlabPrefetcher
 
-            self._prefetch_engine = BackgroundPrefetcher(
-                self._async_fetch_range,
-                self.size,
-                max_prefetch_size=max_prefetch_size,
-                concurrency=self.concurrency,
-                loop=self.gcsfs.loop,
-            )
+                self._prefetch_engine = ZeroCopySlabPrefetcher(
+                    self._async_fetch_range,
+                    self.size,
+                    slab_size=kwargs.get("slab_size") or kwargs.get("block_size") or getattr(self, "block_size", 16 * 1024 * 1024) or (16 * 1024 * 1024),
+                    num_slabs=kwargs.get("num_slabs"),
+                    max_prefetch_bytes=kwargs.get("max_prefetch_bytes", 128 * 1024 * 1024),
+                    concurrency=kwargs.get("concurrency", 1),
+                    loop=self.gcsfs.loop,
+                )
+            else:
+                from .prefetcher import BackgroundPrefetcher
+
+                self._prefetch_engine = BackgroundPrefetcher(
+                    self._async_fetch_range,
+                    self.size,
+                    max_prefetch_size=max_prefetch_size,
+                    concurrency=self.concurrency,
+                    loop=self.gcsfs.loop,
+                )
         else:
             self._prefetch_engine = None
 

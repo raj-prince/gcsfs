@@ -4,7 +4,16 @@ from unittest import mock
 import fsspec.asyn
 import pytest
 
-from gcsfs.prefetcher import BackgroundPrefetcher, RunningAverageTracker, _fast_slice
+from gcsfs.prefetcher import (
+    BackgroundPrefetcher,
+    RunningAverageTracker,
+    _fast_slice,
+)
+from gcsfs.slab_prefetcher import (
+    Slab,
+    SlabPool,
+    ZeroCopySlabPrefetcher,
+)
 
 
 @pytest.fixture
@@ -724,3 +733,105 @@ def test_fast_slice_pypy_fallback():
 
     # 3. Verify exact bounds
     assert _fast_slice(src, 0, len(src)) == src
+
+
+@pytest.mark.asyncio
+async def test_slab_pool_lifecycle():
+    loop = asyncio.get_running_loop()
+    pool = SlabPool(num_slabs=2, slab_size=1024, loop=loop)
+
+    s1 = await pool.acquire(offset=0)
+    assert s1.offset == 0
+    assert s1.index == 0
+
+    s2 = pool.acquire_nowait(offset=1024)
+    assert s2 is not None
+    assert s2.offset == 1024
+    assert s2.index == 1
+
+    # Pool empty
+    assert pool.acquire_nowait(offset=2048) is None
+
+    pool.release(s1)
+    s3 = pool.acquire_nowait(offset=2048)
+    assert s3 is not None
+    assert s3.offset == 2048
+
+
+def test_zero_copy_slab_prefetcher_sequential():
+    data = b"".join(f"{i:08d}".encode("ascii") for i in range(100_000))
+    fetcher = MockFetcher(data)
+    loop = fsspec.asyn.get_loop()
+
+    with ZeroCopySlabPrefetcher(
+        fetcher,
+        len(data),
+        slab_size=1024 * 1024,
+        num_slabs=4,
+        loop=loop,
+    ) as prefetcher:
+        chunk_size = 128 * 1024
+        for offset in range(0, len(data), chunk_size):
+            end = min(offset + chunk_size, len(data))
+            chunk = prefetcher.fetch(offset, end)
+            assert chunk == data[offset:end]
+
+
+def test_zero_copy_slab_prefetcher_spanning_read():
+    data = b"".join(f"{i:08d}".encode("ascii") for i in range(500_000))  # 4 MB
+    fetcher = MockFetcher(data)
+    loop = fsspec.asyn.get_loop()
+
+    # 1MB slab size, read 2.5 MB spanning 3 slabs
+    with ZeroCopySlabPrefetcher(
+        fetcher,
+        len(data),
+        slab_size=1024 * 1024,
+        num_slabs=4,
+        loop=loop,
+    ) as prefetcher:
+        res = prefetcher.fetch(500_000, 3_000_000)
+        assert res == data[500_000:3_000_000]
+
+
+def test_zero_copy_slab_prefetcher_seeks():
+    data = b"".join(f"{i:08d}".encode("ascii") for i in range(500_000))
+    fetcher = MockFetcher(data)
+    loop = fsspec.asyn.get_loop()
+
+    with ZeroCopySlabPrefetcher(
+        fetcher,
+        len(data),
+        slab_size=1024 * 1024,
+        num_slabs=4,
+        loop=loop,
+    ) as prefetcher:
+        # Read from offset 0
+        assert prefetcher.fetch(0, 1000) == data[0:1000]
+
+        # Soft seek inside same slab
+        assert prefetcher.fetch(500, 1500) == data[500:1500]
+
+        # Hard seek forward
+        assert prefetcher.fetch(2_500_000, 2_600_000) == data[2_500_000:2_600_000]
+
+        # Hard seek backward
+        assert prefetcher.fetch(100_000, 200_000) == data[100_000:200_000]
+
+
+def test_zero_copy_slab_prefetcher_eof():
+    data = b"Hello, World! EOF Test."
+    fetcher = MockFetcher(data)
+    loop = fsspec.asyn.get_loop()
+
+    with ZeroCopySlabPrefetcher(
+        fetcher,
+        len(data),
+        slab_size=1024 * 1024,
+        num_slabs=2,
+        loop=loop,
+    ) as prefetcher:
+        assert prefetcher.fetch(0, 100) == data
+        assert prefetcher.fetch(len(data), len(data) + 100) == b""
+        assert prefetcher.fetch(len(data) + 50, len(data) + 100) == b""
+

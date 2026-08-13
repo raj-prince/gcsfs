@@ -312,7 +312,7 @@ class PrefetchProducer:
         avg_io_size = self.tracker.average
         streak = self.consumer.sequential_streak
         is_variable = self.tracker.is_variable
-        last_read_size = self.tracker.last_value
+        last_read_size = self.tracker.last_value if self.tracker._history else (1024 * 1024)
 
         exceeds_user_max = (
             self._user_max_prefetch_size is not None
@@ -755,14 +755,8 @@ class BackgroundPrefetcher:
                 if self.is_stopped:
                     raise RuntimeError("The file instance has been closed.")
 
-                logger.debug("Executing _async_fetch for range %d - %d.", start, end)
-
                 # If the prefetcher is in error state, let's do a hard seek to start offset.
                 if self._error:
-                    logger.info(
-                        "Recovering from error state. Restarting producer at offset: %d",
-                        start,
-                    )
                     self.user_offset = start
                     await self._restart_producer(start)
                 elif start != self.user_offset:
@@ -770,33 +764,15 @@ class BackgroundPrefetcher:
                         self.consumer.offset - self.consumer._current_block_idx
                     )
                     if self.user_offset < start <= self.producer.current_offset:
-                        logger.debug(
-                            "Soft seek detected. Skipping ahead from %d to %d.",
-                            self.user_offset,
-                            start,
-                        )
                         skip_amount = start - self.user_offset
                         await self.consumer.skip(skip_amount)
                         self.user_offset = start
                     elif block_offset <= start < self.consumer.offset:
-                        logger.debug(
-                            "Local seek performed. User offset moved from %d to %d. "
-                            "Adjusting buffer index from %d to %d.",
-                            self.user_offset,
-                            start,
-                            self.consumer._current_block_idx,
-                            start - block_offset,
-                        )
                         self.consumer._current_block_idx = start - block_offset
                         self.consumer.offset = start
                         self.consumer.target_offset = start
                         self.user_offset = start
                     else:
-                        logger.debug(
-                            "Hard seek detected. Moving user offset from %d to %d.",
-                            self.user_offset,
-                            start,
-                        )
                         self.user_offset = start
                         await self._restart_producer(start)
 
@@ -805,16 +781,11 @@ class BackgroundPrefetcher:
 
                 chunk = await self.consumer.consume(requested_size)
                 self.user_offset += len(chunk)
-
-                logger.debug("Completed _async_fetch. Returned %d bytes.", len(chunk))
                 return chunk
             except asyncio.CancelledError as e:
                 self._error = e
                 raise
             except Exception as e:
-                logger.error(
-                    "Exception raised during asynchronous fetch: %s", e, exc_info=True
-                )
                 self._error = e
                 if self.producer and not self.producer.is_stopped:
                     await self.producer.stop()
@@ -873,3 +844,7 @@ class BackgroundPrefetcher:
     def close(self):
         """Safely shuts down the prefetcher from a synchronous context."""
         fsspec.asyn.sync(self.loop, self._async_close)
+
+
+from .slab_prefetcher import Slab, SlabPool, ZeroCopySlabPrefetcher
+

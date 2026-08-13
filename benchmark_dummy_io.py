@@ -1,27 +1,22 @@
-#!/usr/bin/env python3
 """
-Single-Threaded Read Path Dummy IO Benchmark Script for GCSFS with CPU & Memory Resource Tracking.
-
-This script benchmarks the single-threaded CPU processing limit of the GCSFS read path
-by eliminating network cost using dummy IO (`dummy_io=True` / `GCSFS_DUMMY_IO=1`), while tracking:
-- Maximum throughput (MB/s and GB/s)
-- Peak RSS memory usage (MB)
-- Peak CPU utilization (%) and Average CPU utilization (%)
+Single-Threaded Read Path Dummy IO Benchmark Script with Detailed Function Profiling (cProfile).
 
 Usage:
-    python data/benchmark_dummy_io.py [--runtime SECONDS] [--size-gb GB]
+    python benchmark_dummy_io.py [--iterations N] [--size-gb GB] [--profile]
 """
 
 import argparse
+import cProfile
 import logging
 import os
+import pstats
 import resource
 import sys
 import threading
 import time
 
 # Ensure local repository root is prioritized in sys.path
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
@@ -34,7 +29,6 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
-# Suppress noise warnings for clean tabular output
 logging.getLogger("gcsfs").setLevel(logging.ERROR)
 
 
@@ -59,7 +53,7 @@ class ResourceTracker:
         self._start_wall_time = time.perf_counter()
         if HAS_PSUTIL:
             self._proc = psutil.Process()
-            self._proc.cpu_percent(interval=None)  # prime cpu_percent counter
+            self._proc.cpu_percent(interval=None)
         self._thread = threading.Thread(target=self._monitor, daemon=True)
         self._thread.start()
 
@@ -74,7 +68,6 @@ class ResourceTracker:
                     if cpu > self.max_cpu_percent:
                         self.max_cpu_percent = cpu
                 else:
-                    # Linux rusage fallback (in KB)
                     rusage = resource.getrusage(resource.RUSAGE_SELF)
                     mem = rusage.ru_maxrss * 1024
                     if mem > self.max_rss_bytes:
@@ -90,7 +83,6 @@ class ResourceTracker:
         if self._thread:
             self._thread.join()
 
-        # Compare OS maxrss fallback
         rusage_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
         if rusage_bytes > self.max_rss_bytes:
             self.max_rss_bytes = rusage_bytes
@@ -107,7 +99,7 @@ class ResourceTracker:
         return ((self._end_cpu_time - self._start_cpu_time) / wall) * 100.0
 
 
-def run_benchmark(runtime_sec: float = 3.0, file_size_gb: float = 5.0):
+def run_benchmark(iterations: int = 1, file_size_gb: float = 5.0, profile_enabled: bool = False):
     os.environ["GCSFS_DUMMY_IO"] = "1"
 
     fs = gcsfs.GCSFileSystem(token="anon", dummy_io=True)
@@ -128,97 +120,114 @@ def run_benchmark(runtime_sec: float = 3.0, file_size_gb: float = 5.0):
     fs.info = lambda path, **kwargs: fake_info_dict
 
     path = "demo-bucket/test-virtual-file.bin"
-    chunk_sizes_mb = [1, 5, 16, 64]
+    chunk_sizes_mb = [1, 4, 5, 8, 16, 64]
 
     modes = [
-        ("Standard GCSFile (Regional)", BucketType.NON_HIERARCHICAL, "readahead"),
-        # ("ZonalFile (High-Perf gRPC Path)", BucketType.ZONAL_HIERARCHICAL, "readahead_chunked"),
+        ("Standard GCSFile (Regional)", BucketType.NON_HIERARCHICAL),
+    ]
+
+    configs = [
+        ("Direct Buffering (No Prefetch)", False, False, "none"),
+        ("Current BackgroundPrefetcher", True, False, "none"),
+        ("ZeroCopySlabPrefetcher (Fixed Slab Pool + Parallel memoryview)", True, True, "none"),
     ]
 
     tracker = ResourceTracker(interval=0.03)
 
     print("=" * 115, flush=True)
-    print(" GCSFS SINGLE-THREADED READ PATH THROUGHPUT BENCHMARK (WITH DUMMY IO & RESOURCE MONITORING) ", flush=True)
+    print(" GCSFS SINGLE-THREADED READ PATH THROUGHPUT BENCHMARK & CPU PROFILER ", flush=True)
     print("=" * 115, flush=True)
-    print(f" Virtual File Size: {file_size_gb:.1f} GB", flush=True)
-    print(f" Runtime per case: {runtime_sec:.1f} seconds | Tracking: Memory RSS (MB) & CPU Utilization (%)", flush=True)
+    print(f" Virtual File Size: {file_size_gb:.1f} GB | Iterations per case: {iterations} | Profile: {profile_enabled}", flush=True)
     print("=" * 115, flush=True)
 
-    for mode_name, bucket_type, prefetch_cache_type in modes:
+    for mode_name, bucket_type in modes:
         fs._sync_lookup_bucket_type = lambda bucket, _bt=bucket_type: _bt
 
         print(f"\n>>> Mode: {mode_name}", flush=True)
         print("-" * 115, flush=True)
 
-        for use_prefetch in [False, True]:
-            prefetch_label = (
-                "Adaptive Prefetching ON" if use_prefetch else "Direct Buffering (No Prefetch)"
-            )
-            print(f"\n  [ Configuration: {prefetch_label} ]", flush=True)
+        for cfg_label, use_prefetch, use_slab, prefetch_cache_type in configs:
+            print(f"\n  [ Configuration: {cfg_label} ]", flush=True)
 
             for chunk_mb in chunk_sizes_mb:
                 chunk_bytes = chunk_mb * 1024 * 1024
 
                 open_kwargs = {
                     "block_size": chunk_bytes,
-                    "cache_type": prefetch_cache_type if use_prefetch else "none",
+                    "slab_size": max(1024 * 1024, chunk_bytes),
+                    "cache_type": prefetch_cache_type,
                     "use_experimental_adaptive_prefetching": use_prefetch,
+                    "use_slab_prefetcher": use_slab,
                     "dummy_io": True,
                     "size": file_size_bytes,
                 }
 
+                prof = cProfile.Profile() if profile_enabled else None
+
                 with fs.open(path, "rb", **open_kwargs) as f:
                     tracker.start()
+                    if prof:
+                        prof.enable()
                     start_time = time.perf_counter()
                     total_bytes_read = 0
                     read_count = 0
 
-                    while True:
-                        now = time.perf_counter()
-                        if now - start_time >= runtime_sec:
-                            break
-                        data = f.read(chunk_bytes)
-                        if not data:
-                            f.seek(0)
-                            continue
-                        total_bytes_read += len(data)
-                        read_count += 1
+                    for _ in range(iterations):
+                        f.seek(0)
+                        while True:
+                            data = f.read(chunk_bytes)
+                            if not data:
+                                break
+                            total_bytes_read += len(data)
+                            read_count += 1
 
                     elapsed = time.perf_counter() - start_time
+                    if prof:
+                        prof.disable()
                     tracker.stop()
 
-                    throughput_mb_s = (total_bytes_read / (1024 * 1024)) / elapsed
-                    throughput_gb_s = throughput_mb_s / 1024
+                    throughput_gb_s = ((total_bytes_read / (1024 * 1024)) / elapsed) / 1024
                     peak_mem = tracker.peak_mem_mb
                     peak_cpu = tracker.max_cpu_percent
                     avg_cpu = tracker.avg_cpu_percent
 
                     print(
                         f"    Chunk Size: {chunk_mb:>3} MB | "
-                        f"Reads: {read_count:>7} | "
-                        f"Throughput: {throughput_mb_s:>9.2f} MB/s ({throughput_gb_s:>5.2f} GB/s) | "
+                        f"Total Read Ops: {read_count:>7} | "
+                        f"Throughput: {throughput_gb_s:>6.2f} GB/s | "
                         f"Peak Mem: {peak_mem:>7.1f} MB | "
                         f"Peak CPU: {peak_cpu:>5.1f}% (Avg: {avg_cpu:>5.1f}%)",
                         flush=True,
                     )
-    print("\n" + "=" * 115, flush=True)
+
+                    if prof:
+                        print(f"\n    --- Top 15 Functions by Cumulative Time (Chunk Size: {chunk_mb} MB) ---", flush=True)
+                        stats = pstats.Stats(prof)
+                        stats.strip_dirs().sort_stats("cumtime").print_stats(15)
+                        print("-" * 80, flush=True)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Benchmark single-threaded read path throughput using dummy IO with resource monitoring."
+        description="Benchmark single-threaded read path throughput using dummy IO with CPU profiling."
     )
     parser.add_argument(
-        "--runtime",
-        type=float,
-        default=3.0,
-        help="Duration in seconds to run each benchmark configuration (default: 3.0)",
+        "--iterations",
+        "-i",
+        type=int,
+        default=1,
+        help="Number of iterations to read the complete file per configuration (default: 1)",
     )
     parser.add_argument(
         "--size-gb",
         type=float,
-        default=5.0,
-        help="Virtual file size in GB (default: 5.0)",
+        default=2.0,
+        help="Virtual file size in GB (default: 2.0)",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable detailed cProfile function profiling breakdown",
     )
     args = parser.parse_args()
-    run_benchmark(runtime_sec=args.runtime, file_size_gb=args.size_gb)
+    run_benchmark(iterations=args.iterations, file_size_gb=args.size_gb, profile_enabled=args.profile)
