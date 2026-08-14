@@ -148,6 +148,7 @@ class ZeroCopySlabPrefetcher:
         self.streak = 0
         self.last_read_end = -1
         self._last_scheduled_slab = -1
+        self._lookahead_slabs = 2
         self.is_stopped = False
         self._async_lock = asyncio.Lock()
 
@@ -168,22 +169,21 @@ class ZeroCopySlabPrefetcher:
         await self.aclose()
 
     def _update_streak(self, start: int, end: int):
+        """Adapts lookahead window using Linux kernel readahead doubling (mm/readahead.c)."""
+        req_slabs = max(1, (end - start + self.slab_size - 1) // self.slab_size)
         if self.last_read_end != -1 and start == self.last_read_end:
             self.streak += 1
+            # Kernel exponential doubling: 2 -> 4 -> 8 (capped at num_slabs)
+            self._lookahead_slabs = min(self.num_slabs, max(req_slabs + 1, self._lookahead_slabs * 2))
         else:
+            # Random seek: reset to initial lookahead
             self.streak = 1
+            self._lookahead_slabs = min(self.num_slabs, req_slabs + 1)
             self._last_scheduled_slab = -1
         self.last_read_end = end
 
     def _get_lookahead_slabs(self) -> int:
-        if self.streak <= 1:
-            return min(2, self.num_slabs)
-        elif self.streak == 2:
-            return min(2, self.num_slabs)
-        elif self.streak == 3:
-            return min(4, self.num_slabs)
-        else:
-            return self.num_slabs
+        return self._lookahead_slabs
 
     async def _fill_slab_parallel(self, slab: Slab):
         """Downloads a chunk directly into slab.master_view with zero intermediate byte concatenation."""

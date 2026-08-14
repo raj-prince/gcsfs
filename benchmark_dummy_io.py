@@ -115,6 +115,7 @@ def run_benchmark(
     ttfb_ms: float = 0.0,
     bandwidth_mbps: float = 0.0,
     byte_latency_ns: float = 0.0,
+    concurrency: int = 1,
     profile_enabled: bool = False,
 ):
     os.environ["GCSFS_DUMMY_IO"] = "1"
@@ -154,7 +155,7 @@ def run_benchmark(
     ]
 
     configs = [
-        ("Direct Buffering (No Prefetch)", False, False, "none"),
+        # ("Direct Buffering (No Prefetch)", False, False, "none"),
         ("Current BackgroundPrefetcher", True, False, "none"),
         ("ZeroCopySlabPrefetcher (Fixed Slab Pool + Parallel memoryview)", True, True, "none"),
     ]
@@ -174,7 +175,7 @@ def run_benchmark(
     print("=" * 115, flush=True)
     print(" GCSFS SINGLE-THREADED READ PATH THROUGHPUT BENCHMARK & CPU PROFILER ", flush=True)
     print("=" * 115, flush=True)
-    print(f" Virtual File Size: {file_size_gb:.1f} GB | Iterations: {iterations} | Simulation: {', '.join(latency_desc)}", flush=True)
+    print(f" Virtual File Size: {file_size_gb:.1f} GB | Concurrency: {concurrency} | Iterations: {iterations} | Simulation: {', '.join(latency_desc)}", flush=True)
     print("=" * 115, flush=True)
 
     results = {}
@@ -193,10 +194,11 @@ def run_benchmark(
 
                 open_kwargs = {
                     "block_size": chunk_bytes,
-                    "slab_size": max(1024 * 1024, chunk_bytes),
+                    "slab_size": max(16 * 1024 * 1024, chunk_bytes),
                     "cache_type": prefetch_cache_type,
                     "use_experimental_adaptive_prefetching": use_prefetch,
                     "use_slab_prefetcher": use_slab,
+                    "concurrency": concurrency,
                     "dummy_io": True,
                     "size": file_size_bytes,
                 }
@@ -326,6 +328,12 @@ if __name__ == "__main__":
         help="Simulated per-byte latency in nanoseconds (default: 0.0, e.g. 1.0 ns/byte = 1000 MB/s)",
     )
     parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Sub-range download concurrency per chunk / slab (default: 1)",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Enable detailed cProfile function profiling breakdown",
@@ -340,5 +348,6 @@ if __name__ == "__main__":
         ttfb_ms=args.ttfb_ms,
         bandwidth_mbps=args.bandwidth_mbps,
         byte_latency_ns=args.byte_latency_ns,
+        concurrency=args.concurrency,
         profile_enabled=args.profile,
     )
