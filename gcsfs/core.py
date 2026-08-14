@@ -1223,6 +1223,18 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             elif end is None:
                 end = (await self._info(path))["size"]
             size = max(0, end - start)
+
+            # Simulated network TTFB and per-byte latency
+            ttfb_s = getattr(self, "dummy_ttfb_s", 0.0) or (float(os.environ.get("GCSFS_DUMMY_TTFB_MS", "0")) / 1000.0)
+            byte_latency_s = getattr(self, "dummy_byte_latency_s", 0.0) or (float(os.environ.get("GCSFS_DUMMY_BYTE_LATENCY_NS", "0")) / 1e9)
+            bandwidth_bps = getattr(self, "dummy_bandwidth_bps", 0.0) or (float(os.environ.get("GCSFS_DUMMY_BANDWIDTH_MBPS", "0")) * 1024 * 1024)
+            if bandwidth_bps > 0:
+                byte_latency_s = 1.0 / bandwidth_bps
+
+            delay = ttfb_s + (size * byte_latency_s)
+            if delay > 0:
+                await asyncio.sleep(delay)
+
             return b"\x00" * size
 
         u2 = self.url(path, generation=kwargs.get("generation"))

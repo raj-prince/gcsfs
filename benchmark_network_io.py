@@ -138,7 +138,7 @@ def run_network_benchmark(
     file_size_gb = file_size_mb / 1024
 
     configs = [
-        ("Direct Buffering (No Prefetch)", False, False, "none"),
+        # ("Direct Buffering (No Prefetch)", False, False, "none"),
         ("Current BackgroundPrefetcher", True, False, "none"),
         ("ZeroCopySlabPrefetcher (Fixed Slab Pool + Zero-Copy)", True, True, "none"),
     ]
@@ -164,7 +164,7 @@ def run_network_benchmark(
 
             open_kwargs = {
                 "block_size": chunk_bytes,
-                "slab_size": max(1024 * 1024, chunk_bytes),
+                "slab_size": max(16 * 1024 * 1024, chunk_bytes),
                 "cache_type": prefetch_cache_type,
                 "use_experimental_adaptive_prefetching": use_prefetch,
                 "use_slab_prefetcher": use_slab,

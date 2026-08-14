@@ -1,11 +1,12 @@
 """
-Single-Threaded Read Path Dummy IO Benchmark Script with Detailed Function Profiling (cProfile).
+Single-Threaded Read Path Dummy IO Benchmark Script with Network Latency Simulation (TTFB & Bandwidth).
 
 Usage:
-    python benchmark_dummy_io.py [--iterations N] [--size-gb GB] [--profile]
+    python benchmark_dummy_io.py [--iterations N] [--size-gb GB] [--ttfb-ms MS] [--bandwidth-mbps MBPS] [--profile]
 """
 
 import argparse
+import asyncio
 import cProfile
 import logging
 import os
@@ -99,10 +100,35 @@ class ResourceTracker:
         return ((self._end_cpu_time - self._start_cpu_time) / wall) * 100.0
 
 
-def run_benchmark(iterations: int = 1, file_size_gb: float = 5.0, profile_enabled: bool = False):
+def format_speed(bytes_per_sec: float) -> str:
+    """Formats transfer speed into MB/s or GB/s."""
+    mb_s = bytes_per_sec / (1024 * 1024)
+    if mb_s >= 1024:
+        return f"{mb_s / 1024:.2f} GB/s"
+    return f"{mb_s:.2f} MB/s"
+
+
+def run_benchmark(
+    iterations: int = 1,
+    file_size_gb: float = 2.0,
+    chunk_sizes_mb: list[int] | None = None,
+    ttfb_ms: float = 0.0,
+    bandwidth_mbps: float = 0.0,
+    byte_latency_ns: float = 0.0,
+    profile_enabled: bool = False,
+):
     os.environ["GCSFS_DUMMY_IO"] = "1"
+    if ttfb_ms > 0:
+        os.environ["GCSFS_DUMMY_TTFB_MS"] = str(ttfb_ms)
+    if bandwidth_mbps > 0:
+        os.environ["GCSFS_DUMMY_BANDWIDTH_MBPS"] = str(bandwidth_mbps)
+    if byte_latency_ns > 0:
+        os.environ["GCSFS_DUMMY_BYTE_LATENCY_NS"] = str(byte_latency_ns)
 
     fs = gcsfs.GCSFileSystem(token="anon", dummy_io=True)
+    fs.dummy_ttfb_s = ttfb_ms / 1000.0
+    fs.dummy_bandwidth_bps = bandwidth_mbps * 1024 * 1024
+    fs.dummy_byte_latency_s = byte_latency_ns / 1e9
 
     file_size_bytes = int(file_size_gb * 1024 * 1024 * 1024)
     fake_info_dict = {
@@ -120,7 +146,8 @@ def run_benchmark(iterations: int = 1, file_size_gb: float = 5.0, profile_enable
     fs.info = lambda path, **kwargs: fake_info_dict
 
     path = "demo-bucket/test-virtual-file.bin"
-    chunk_sizes_mb = [1, 4, 5, 8, 16, 64]
+    if chunk_sizes_mb is None:
+        chunk_sizes_mb = [1, 4, 5, 8, 16, 64]
 
     modes = [
         ("Standard GCSFile (Regional)", BucketType.NON_HIERARCHICAL),
@@ -134,11 +161,23 @@ def run_benchmark(iterations: int = 1, file_size_gb: float = 5.0, profile_enable
 
     tracker = ResourceTracker(interval=0.03)
 
+    latency_desc = []
+    if ttfb_ms > 0:
+        latency_desc.append(f"TTFB: {ttfb_ms:.1f} ms")
+    if bandwidth_mbps > 0:
+        latency_desc.append(f"Bandwidth: {bandwidth_mbps:.1f} MB/s")
+    if byte_latency_ns > 0:
+        latency_desc.append(f"Per-Byte Latency: {byte_latency_ns:.2f} ns")
+    if not latency_desc:
+        latency_desc = ["Zero Network Latency (Pure CPU)"]
+
     print("=" * 115, flush=True)
     print(" GCSFS SINGLE-THREADED READ PATH THROUGHPUT BENCHMARK & CPU PROFILER ", flush=True)
     print("=" * 115, flush=True)
-    print(f" Virtual File Size: {file_size_gb:.1f} GB | Iterations per case: {iterations} | Profile: {profile_enabled}", flush=True)
+    print(f" Virtual File Size: {file_size_gb:.1f} GB | Iterations: {iterations} | Simulation: {', '.join(latency_desc)}", flush=True)
     print("=" * 115, flush=True)
+
+    results = {}
 
     for mode_name, bucket_type in modes:
         fs._sync_lookup_bucket_type = lambda bucket, _bt=bucket_type: _bt
@@ -168,6 +207,7 @@ def run_benchmark(iterations: int = 1, file_size_gb: float = 5.0, profile_enable
                     tracker.start()
                     if prof:
                         prof.enable()
+
                     start_time = time.perf_counter()
                     total_bytes_read = 0
                     read_count = 0
@@ -186,7 +226,10 @@ def run_benchmark(iterations: int = 1, file_size_gb: float = 5.0, profile_enable
                         prof.disable()
                     tracker.stop()
 
-                    throughput_gb_s = ((total_bytes_read / (1024 * 1024)) / elapsed) / 1024
+                    bytes_per_sec = total_bytes_read / max(1e-6, elapsed)
+                    results[(cfg_label, chunk_mb)] = bytes_per_sec
+                    speed_str = format_speed(bytes_per_sec)
+
                     peak_mem = tracker.peak_mem_mb
                     peak_cpu = tracker.max_cpu_percent
                     avg_cpu = tracker.avg_cpu_percent
@@ -194,7 +237,8 @@ def run_benchmark(iterations: int = 1, file_size_gb: float = 5.0, profile_enable
                     print(
                         f"    Chunk Size: {chunk_mb:>3} MB | "
                         f"Total Read Ops: {read_count:>7} | "
-                        f"Throughput: {throughput_gb_s:>6.2f} GB/s | "
+                        f"Time: {elapsed:>6.3f}s | "
+                        f"Throughput: {speed_str:>10} | "
                         f"Peak Mem: {peak_mem:>7.1f} MB | "
                         f"Peak CPU: {peak_cpu:>5.1f}% (Avg: {avg_cpu:>5.1f}%)",
                         flush=True,
@@ -206,10 +250,42 @@ def run_benchmark(iterations: int = 1, file_size_gb: float = 5.0, profile_enable
                         stats.strip_dirs().sort_stats("cumtime").print_stats(15)
                         print("-" * 80, flush=True)
 
+    # Summary Comparison Table
+    print("\n" + "=" * 115, flush=True)
+    print(" SUMMARY THROUGHPUT COMPARISON ", flush=True)
+    print("=" * 115, flush=True)
+    header = f"{'Chunk Size':<12} | {'Direct Buffering':<20} | {'BackgroundPrefetcher':<22} | {'ZeroCopySlabPrefetcher':<24} | {'Winner & Speedup':<25}"
+    print(header)
+    print("-" * 115)
+
+    for chunk_mb in chunk_sizes_mb:
+        direct_speed = results.get(("Direct Buffering (No Prefetch)", chunk_mb), 0.0)
+        bg_speed = results.get(("Current BackgroundPrefetcher", chunk_mb), 0.0)
+        slab_speed = results.get(("ZeroCopySlabPrefetcher (Fixed Slab Pool + Parallel memoryview)", chunk_mb), 0.0)
+
+        direct_str = format_speed(direct_speed) if direct_speed else "N/A"
+        bg_str = format_speed(bg_speed) if bg_speed else "N/A"
+        slab_str = format_speed(slab_speed) if slab_speed else "N/A"
+
+        if slab_speed > 0 and bg_speed > 0:
+            if slab_speed >= bg_speed:
+                pct = ((slab_speed - bg_speed) / bg_speed) * 100.0
+                winner_str = f"ZeroCopySlab (+{pct:.1f}%)"
+            else:
+                pct = ((bg_speed - slab_speed) / slab_speed) * 100.0
+                winner_str = f"Background (+{pct:.1f}%)"
+        else:
+            winner_str = "N/A"
+
+        row = f"{str(chunk_mb) + ' MB':<12} | {direct_str:<20} | {bg_str:<22} | {slab_str:<24} | {winner_str:<25}"
+        print(row)
+
+    print("=" * 115 + "\n", flush=True)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Benchmark single-threaded read path throughput using dummy IO with CPU profiling."
+        description="Benchmark single-threaded read path throughput using dummy IO with simulated network latency & bandwidth."
     )
     parser.add_argument(
         "--iterations",
@@ -225,9 +301,44 @@ if __name__ == "__main__":
         help="Virtual file size in GB (default: 2.0)",
     )
     parser.add_argument(
+        "--chunk-sizes",
+        "-c",
+        type=str,
+        default="1,4,5,8,16,64",
+        help="Comma-separated chunk sizes in MB (default: '1,4,5,8,16,64')",
+    )
+    parser.add_argument(
+        "--ttfb-ms",
+        type=float,
+        default=0.0,
+        help="Simulated fixed TTFB latency per HTTP range fetch in milliseconds (default: 0.0, e.g. 10.0)",
+    )
+    parser.add_argument(
+        "--bandwidth-mbps",
+        type=float,
+        default=0.0,
+        help="Simulated network bandwidth in MB/s (default: 0.0 for unlimited, e.g. 500.0, 1000.0)",
+    )
+    parser.add_argument(
+        "--byte-latency-ns",
+        type=float,
+        default=0.0,
+        help="Simulated per-byte latency in nanoseconds (default: 0.0, e.g. 1.0 ns/byte = 1000 MB/s)",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Enable detailed cProfile function profiling breakdown",
     )
     args = parser.parse_args()
-    run_benchmark(iterations=args.iterations, file_size_gb=args.size_gb, profile_enabled=args.profile)
+    chunks = [int(x.strip()) for x in args.chunk_sizes.split(",") if x.strip()]
+
+    run_benchmark(
+        iterations=args.iterations,
+        file_size_gb=args.size_gb,
+        chunk_sizes_mb=chunks,
+        ttfb_ms=args.ttfb_ms,
+        bandwidth_mbps=args.bandwidth_mbps,
+        byte_latency_ns=args.byte_latency_ns,
+        profile_enabled=args.profile,
+    )

@@ -118,6 +118,8 @@ class ZeroCopySlabPrefetcher:
     6. Instant-hit caching for seeks within prefetched slab ranges.
     7. Dynamic streak-based lookahead scaling ($1 \to 2 \to 4 \to 8$ slabs).
     """
+    MIN_SLAB_SIZE = 16 * 1024 * 1024  # 16 MB network request floor for TCP saturation
+
     def __init__(
         self,
         fetcher,
@@ -130,7 +132,7 @@ class ZeroCopySlabPrefetcher:
     ):
         self.fetcher = fetcher
         self.size = size
-        self.slab_size = max(1024 * 1024, slab_size)
+        self.slab_size = max(self.MIN_SLAB_SIZE, slab_size)
         self.max_prefetch_bytes = max(self.slab_size, max_prefetch_bytes)
         if num_slabs is None:
             self.num_slabs = max(2, min(8, self.max_prefetch_bytes // self.slab_size))
@@ -145,6 +147,7 @@ class ZeroCopySlabPrefetcher:
         self.current_user_offset = 0
         self.streak = 0
         self.last_read_end = -1
+        self._last_scheduled_slab = -1
         self.is_stopped = False
         self._async_lock = asyncio.Lock()
 
@@ -169,6 +172,7 @@ class ZeroCopySlabPrefetcher:
             self.streak += 1
         else:
             self.streak = 1
+            self._last_scheduled_slab = -1
         self.last_read_end = end
 
     def _get_lookahead_slabs(self) -> int:
@@ -284,7 +288,8 @@ class ZeroCopySlabPrefetcher:
             if avail >= req_len:
                 data = slab.slice_data(rel_start, rel_start + req_len)
                 self.current_user_offset = end
-                if rel_start + req_len >= (slab.valid_size // 2):
+                if aligned_start > self._last_scheduled_slab and rel_start + req_len >= (slab.valid_size // 2):
+                    self._last_scheduled_slab = aligned_start
                     self._ensure_prefetch_window(end)
                 return data
 
@@ -296,7 +301,9 @@ class ZeroCopySlabPrefetcher:
                 if next_slab.valid_size >= part2_len:
                     part2 = next_slab.slice_data(0, part2_len)
                     self.current_user_offset = end
-                    self._ensure_prefetch_window(end)
+                    if next_aligned > self._last_scheduled_slab:
+                        self._last_scheduled_slab = next_aligned
+                        self._ensure_prefetch_window(end)
                     return part1 + part2
 
         async with self._async_lock:
@@ -368,7 +375,8 @@ class ZeroCopySlabPrefetcher:
                 if avail >= req_len:
                     data = slab.slice_data(rel_start, rel_start + req_len)
                     self.current_user_offset = end
-                    if rel_start + req_len >= (slab.valid_size // 2):
+                    if aligned_start > self._last_scheduled_slab and rel_start + req_len >= (slab.valid_size // 2):
+                        self._last_scheduled_slab = aligned_start
                         self.loop.call_soon_threadsafe(self._ensure_prefetch_window, end)
                     return data
 
@@ -380,7 +388,9 @@ class ZeroCopySlabPrefetcher:
                     if next_slab.valid_size >= part2_len:
                         part2 = next_slab.slice_data(0, part2_len)
                         self.current_user_offset = end
-                        self.loop.call_soon_threadsafe(self._ensure_prefetch_window, end)
+                        if next_aligned > self._last_scheduled_slab:
+                            self._last_scheduled_slab = next_aligned
+                            self.loop.call_soon_threadsafe(self._ensure_prefetch_window, end)
                         return part1 + part2
 
         return fsspec.asyn.sync(self.loop, self.afetch, start, end)
