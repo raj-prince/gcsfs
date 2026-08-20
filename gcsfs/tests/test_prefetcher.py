@@ -835,3 +835,68 @@ def test_zero_copy_slab_prefetcher_eof():
         assert prefetcher.fetch(len(data), len(data) + 100) == b""
         assert prefetcher.fetch(len(data) + 50, len(data) + 100) == b""
 
+
+def test_background_prefetcher_fetch_into(prefetcher_factory):
+    data = b"".join(f"{i:08d}".encode("ascii") for i in range(10_000))
+    fetcher = MockFetcher(data)
+    bp = prefetcher_factory(fetcher=fetcher, size=len(data), concurrency=2)
+
+    buf = bytearray(800)
+    # Read 800 bytes
+    n = bp.fetch_into(0, buf)
+    assert n == 800
+    assert bytes(buf[:n]) == data[:800]
+
+    # Read next 800 bytes
+    n2 = bp.fetch_into(800, buf)
+    assert n2 == 800
+    assert bytes(buf[:n2]) == data[800:1600]
+
+    # Sequential stream using fetch_into with buffer reuse
+    read_total = 0
+    buf_chunk = bytearray(1024)
+    while read_total < len(data):
+        n = bp.fetch_into(read_total, buf_chunk)
+        if n == 0:
+            break
+        assert bytes(buf_chunk[:n]) == data[read_total : read_total + n]
+        read_total += n
+    assert read_total == len(data)
+
+    # EOF read
+    assert bp.fetch_into(len(data), buf_chunk) == 0
+    bp.close()
+
+
+def test_zero_copy_slab_prefetcher_fetch_into():
+    data = b"".join(f"{i:08d}".encode("ascii") for i in range(500_000))  # 4 MB
+    fetcher = MockFetcher(data)
+    loop = fsspec.asyn.get_loop()
+
+    with ZeroCopySlabPrefetcher(
+        fetcher,
+        len(data),
+        slab_size=1024 * 1024,
+        num_slabs=4,
+        loop=loop,
+    ) as prefetcher:
+        buf = bytearray(64 * 1024)
+        read_total = 0
+        while read_total < len(data):
+            n = prefetcher.fetch_into(read_total, buf)
+            if n == 0:
+                break
+            assert bytes(buf[:n]) == data[read_total : read_total + n]
+            read_total += n
+        assert read_total == len(data)
+
+        # Spanning readinto across slabs
+        big_buf = bytearray(2_500_000)
+        n = prefetcher.fetch_into(500_000, big_buf)
+        assert n == 2_500_000
+        assert bytes(big_buf[:n]) == data[500_000:3_000_000]
+
+        # EOF
+        assert prefetcher.fetch_into(len(data), buf) == 0
+
+

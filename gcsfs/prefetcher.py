@@ -608,6 +608,104 @@ class PrefetchConsumer:
 
         return await asyncio.to_thread(b"".join, chunks)
 
+    async def consume_into(self, dest) -> int:
+        """Pulls bytes directly into a pre-allocated writable buffer 'dest'.
+
+        Eliminates intermediate bytes allocations and buffer stitching.
+
+        Args:
+            dest: A writable memoryview or buffer-compatible object.
+
+        Returns:
+            int: The number of bytes written into dest.
+        """
+        dest_view = memoryview(dest).cast("B")
+        size = len(dest_view)
+        if size <= 0:
+            return 0
+
+        processed = 0
+        self.target_offset = self.offset + size
+
+        while processed < size:
+            available = len(self._current_block) - self._current_block_idx
+            trigger_wakeup = False
+
+            if not available:
+                is_producer_stopped = (
+                    self.orchestrator.producer is None
+                    or self.orchestrator.producer.is_stopped
+                )
+                if is_producer_stopped and self.queue.empty():
+                    logger.debug("Consumer reached EOF.")
+                    break
+
+                if self.queue.empty():
+                    logger.debug("Queue is empty. Waking up producer.")
+                    self.wakeup_event.set()
+
+                task = await self.queue.get()
+
+                if isinstance(task, Exception):
+                    logger.error("Consumer retrieved an exception: %s", task)
+                    self.orchestrator.set_error(task)
+                    raise task
+
+                try:
+                    block = await task
+
+                    self.sequential_streak += 1
+                    if (
+                        self.sequential_streak
+                        >= PrefetchProducer.MIN_STREAKS_FOR_PREFETCHING
+                    ):
+                        exceeds_user_max = (
+                            self.orchestrator.max_prefetch_size is not None
+                            and self.tracker.average
+                            > self.orchestrator.max_prefetch_size
+                        )
+                        is_massive_variable = (
+                            self.tracker.is_variable
+                            and self.tracker.average
+                            > PrefetchProducer.VARIABLE_IO_THRESHOLD
+                        )
+
+                        if not (is_massive_variable or exceeds_user_max):
+                            trigger_wakeup = True
+                        else:
+                            logger.debug(
+                                "Suppressing proactive producer wakeup due to massive variable"
+                                " workload or exceeding user max prefetch."
+                            )
+
+                    self._current_block = block
+                    self._current_block_idx = 0
+                    available = len(self._current_block)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error("Consumer caught an error: %s", e, exc_info=True)
+                    self.orchestrator.set_error(e)
+                    raise e
+
+            if not self._current_block:
+                break
+
+            needed = size - processed
+            take = min(needed, available)
+
+            dest_view[processed : processed + take] = memoryview(self._current_block)[
+                self._current_block_idx : self._current_block_idx + take
+            ]
+
+            self._current_block_idx += take
+            processed += take
+            self.offset += take
+            if trigger_wakeup:
+                self.wakeup_event.set()
+
+        return processed
+
     async def skip(self, size: int) -> None:
         """Advances the consumer offset without allocating memory."""
         await self._advance(size, save_data=False)
@@ -836,6 +934,77 @@ class BackgroundPrefetcher:
         """Synchronous API wrapper delegating to `afetch`."""
         # Delegates all boundaries, checking, and fetching to the async event loop perfectly
         return fsspec.asyn.sync(self.loop, self.afetch, start, end)
+
+    async def _async_fetch_into(self, start: int, buffer: memoryview) -> int:
+        """Core internal async fetching logic directly into buffer, protected safely by the async lock."""
+        async with self._async_lock:
+            try:
+                if self.is_stopped:
+                    raise RuntimeError("The file instance has been closed.")
+
+                # If the prefetcher is in error state, let's do a hard seek to start offset.
+                if self._error:
+                    self.user_offset = start
+                    await self._restart_producer(start)
+                elif start != self.user_offset:
+                    block_offset = (
+                        self.consumer.offset - self.consumer._current_block_idx
+                    )
+                    if self.user_offset < start <= self.producer.current_offset:
+                        skip_amount = start - self.user_offset
+                        await self.consumer.skip(skip_amount)
+                        self.user_offset = start
+                    elif block_offset <= start < self.consumer.offset:
+                        self.consumer._current_block_idx = start - block_offset
+                        self.consumer.offset = start
+                        self.consumer.target_offset = start
+                        self.user_offset = start
+                    else:
+                        self.user_offset = start
+                        await self._restart_producer(start)
+
+                requested_size = len(buffer)
+                self.read_tracker.add(requested_size)
+
+                nbytes = await self.consumer.consume_into(buffer)
+                self.user_offset += nbytes
+                return nbytes
+            except asyncio.CancelledError as e:
+                self._error = e
+                raise
+            except Exception as e:
+                self._error = e
+                if self.producer and not self.producer.is_stopped:
+                    await self.producer.stop()
+                raise
+
+    async def afetch_into(self, start: int | None, buffer) -> int:
+        """Asynchronous API counterpart to `fetch_into`."""
+        if start is None:
+            start = self.user_offset
+        if start >= self.size:
+            return 0
+
+        if self.is_stopped:
+            logger.error(
+                "Cannot fetch data: BackgroundPrefetcher is stopped or closed."
+            )
+            raise RuntimeError(
+                "The file instance has been closed. This can occur if a close operation "
+                "is executed concurrently while a read operation is still in progress."
+            )
+
+        view = memoryview(buffer).cast("B")
+        if start + len(view) > self.size:
+            view = view[: max(0, self.size - start)]
+        if len(view) == 0:
+            return 0
+
+        return await self._async_fetch_into(start, view)
+
+    def fetch_into(self, start: int | None, buffer) -> int:
+        """Synchronous API wrapper delegating to `afetch_into`."""
+        return fsspec.asyn.sync(self.loop, self.afetch_into, start, buffer)
 
     async def aclose(self):
         """Safely shuts down the prefetcher from an asynchronous context."""

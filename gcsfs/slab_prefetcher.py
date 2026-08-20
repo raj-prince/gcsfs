@@ -75,6 +75,15 @@ class Slab:
             return memoryview(self.raw_bytes)[self.raw_offset + rel_start : self.raw_offset + rel_end]
         return self.master_view[rel_start:rel_end]
 
+    def slice_into(self, rel_start: int, rel_end: int, dest: memoryview) -> int:
+        """Copies directly into dest memoryview without intermediate bytes allocation."""
+        length = rel_end - rel_start
+        if self.raw_bytes is not None:
+            dest[:length] = memoryview(self.raw_bytes)[self.raw_offset + rel_start : self.raw_offset + rel_end]
+        else:
+            dest[:length] = self.master_view[rel_start:rel_end]
+        return length
+
 
 class SlabPool:
     """Fixed pool of recyclable slabs that eliminates runtime memory allocations."""
@@ -135,7 +144,7 @@ class ZeroCopySlabPrefetcher:
         self.slab_size = max(self.MIN_SLAB_SIZE, slab_size)
         self.max_prefetch_bytes = max(self.slab_size, max_prefetch_bytes)
         if num_slabs is None:
-            self.num_slabs = max(2, min(8, self.max_prefetch_bytes // self.slab_size))
+            self.num_slabs = max(2, self.max_prefetch_bytes // self.slab_size)
         else:
             self.num_slabs = max(1, num_slabs)
         self.concurrency = max(1, concurrency)
@@ -151,6 +160,16 @@ class ZeroCopySlabPrefetcher:
         self._lookahead_slabs = 2
         self.is_stopped = False
         self._async_lock = asyncio.Lock()
+
+        logger.debug(
+            "Starting ZeroCopySlabPrefetcher. Size: %d, Slab Size: %d (%d MB), Num Slabs: %d, Concurrency: %d, Max Prefetch: %d",
+            self.size,
+            self.slab_size,
+            self.slab_size // (1024 * 1024),
+            self.num_slabs,
+            self.concurrency,
+            self.max_prefetch_bytes,
+        )
 
         # Warm initial prefetch window immediately in event loop
         if self.loop.is_running():
@@ -181,6 +200,12 @@ class ZeroCopySlabPrefetcher:
             self._lookahead_slabs = min(self.num_slabs, req_slabs + 1)
             self._last_scheduled_slab = -1
         self.last_read_end = end
+        logger.debug(
+            "ZeroCopySlab streak updated: streak=%d, lookahead_slabs=%d (%d MB)",
+            self.streak,
+            self._lookahead_slabs,
+            (self._lookahead_slabs * self.slab_size) // (1024 * 1024),
+        )
 
     def _get_lookahead_slabs(self) -> int:
         return self._lookahead_slabs
@@ -196,6 +221,14 @@ class ZeroCopySlabPrefetcher:
                 slab.ready_event.set()
                 return
 
+            logger.debug(
+                "Spawning slab fetch task. Slab Index: %d, Offset: %d, Size: %d, Concurrency: %d",
+                slab.index,
+                chunk_start,
+                chunk_len,
+                self.concurrency,
+            )
+
             if self.concurrency <= 1:
                 data = await self.fetcher(chunk_start, chunk_len, split_factor=1)
                 data_len = len(data)
@@ -205,6 +238,12 @@ class ZeroCopySlabPrefetcher:
                     slab.master_view[:data_len] = data
                 slab.valid_size = data_len
                 slab.ready_event.set()
+                logger.debug(
+                    "Slab Index: %d at Offset: %d ready (valid_size: %d bytes)",
+                    slab.index,
+                    chunk_start,
+                    slab.valid_size,
+                )
                 return
 
             sub_size = (chunk_len + self.concurrency - 1) // self.concurrency
@@ -227,6 +266,12 @@ class ZeroCopySlabPrefetcher:
             await asyncio.gather(*sub_tasks)
             slab.valid_size = chunk_len
             slab.ready_event.set()
+            logger.debug(
+                "Slab Index: %d at Offset: %d ready (valid_size: %d bytes)",
+                slab.index,
+                chunk_start,
+                slab.valid_size,
+            )
         except asyncio.CancelledError:
             slab.valid_size = 0
             slab.ready_event.set()
@@ -235,6 +280,7 @@ class ZeroCopySlabPrefetcher:
             slab.error = e
             slab.valid_size = 0
             slab.ready_event.set()
+            logger.error("Error filling slab index %d at offset %d: %s", slab.index, chunk_start, e)
 
     def _evict_out_of_window_slabs(self, window_start: int, window_end: int):
         """Evicts and recycles slabs outside the prefetch active window."""
@@ -244,6 +290,7 @@ class ZeroCopySlabPrefetcher:
                 to_evict.append(offset)
         for offset in to_evict:
             slab = self.active_slabs.pop(offset)
+            logger.debug("Evicting out-of-window slab index %d at offset %d", slab.index, offset)
             self.slab_pool.release(slab)
 
     def _ensure_prefetch_window(self, user_start: int):
@@ -257,6 +304,14 @@ class ZeroCopySlabPrefetcher:
 
         # Evict slabs outside active window
         self._evict_out_of_window_slabs(aligned_user_start, active_window_end)
+
+        logger.debug(
+            "Ensuring prefetch window for user_start=%d (aligned=%d, lookahead_slabs=%d, active_slabs=%d)",
+            user_start,
+            aligned_user_start,
+            lookahead_slabs,
+            len(self.active_slabs),
+        )
 
         for i in range(lookahead_slabs):
             target_offset = aligned_user_start + (i * self.slab_size)
@@ -352,6 +407,7 @@ class ZeroCopySlabPrefetcher:
             start = 0
         if end is None:
             end = self.size
+        logger.debug("Asynchronous afetch called for bounds start=%d, end=%d", start, end)
         return await self._async_fetch(start, end)
 
     def fetch(self, start: int | None, end: int | None) -> bytes:
@@ -364,6 +420,7 @@ class ZeroCopySlabPrefetcher:
         if start >= self.size or start >= end:
             return b""
 
+        logger.debug("Synchronous fetch called for bounds start=%d, end=%d", start, end)
         self._update_streak(start, end)
         if not self.is_stopped:
             aligned_start = (start // self.slab_size) * self.slab_size
@@ -375,6 +432,7 @@ class ZeroCopySlabPrefetcher:
                 if avail >= req_len:
                     data = slab.slice_data(rel_start, rel_start + req_len)
                     self.current_user_offset = end
+                    logger.debug("Fast-path in-RAM slab cache hit for [%d..%d]", start, end)
                     if aligned_start > self._last_scheduled_slab and rel_start + req_len >= (slab.valid_size // 2):
                         self._last_scheduled_slab = aligned_start
                         self.loop.call_soon_threadsafe(self._ensure_prefetch_window, end)
@@ -388,12 +446,153 @@ class ZeroCopySlabPrefetcher:
                     if next_slab.valid_size >= part2_len:
                         part2 = next_slab.slice_data(0, part2_len)
                         self.current_user_offset = end
+                        logger.debug("Fast-path multi-slab in-RAM hit for [%d..%d]", start, end)
                         if next_aligned > self._last_scheduled_slab:
                             self._last_scheduled_slab = next_aligned
                             self.loop.call_soon_threadsafe(self._ensure_prefetch_window, end)
                         return part1 + part2
 
         return fsspec.asyn.sync(self.loop, self.afetch, start, end)
+
+    async def _async_fetch_into(self, start: int, dest_view: memoryview) -> int:
+        if self.is_stopped:
+            raise RuntimeError("The file instance has been closed.")
+
+        req_len = len(dest_view)
+        if req_len == 0 or start >= self.size:
+            return 0
+
+        end = min(self.size, start + req_len)
+        actual_req_len = end - start
+        if actual_req_len <= 0:
+            return 0
+        dest = dest_view[:actual_req_len]
+
+        self._update_streak(start, end)
+        aligned_start = (start // self.slab_size) * self.slab_size
+        slab = self.active_slabs.get(aligned_start)
+        if slab is not None and slab.ready_event.is_set() and not slab.error:
+            rel_start = start - slab.offset
+            avail = slab.valid_size - rel_start
+            if avail >= actual_req_len:
+                slab.slice_into(rel_start, rel_start + actual_req_len, dest)
+                self.current_user_offset = end
+                if aligned_start > self._last_scheduled_slab and rel_start + actual_req_len >= (slab.valid_size // 2):
+                    self._last_scheduled_slab = aligned_start
+                    self._ensure_prefetch_window(end)
+                return actual_req_len
+
+            next_aligned = aligned_start + self.slab_size
+            next_slab = self.active_slabs.get(next_aligned)
+            if next_slab is not None and next_slab.ready_event.is_set() and not next_slab.error:
+                part1_len = slab.slice_into(rel_start, slab.valid_size, dest)
+                part2_len = actual_req_len - part1_len
+                if next_slab.valid_size >= part2_len:
+                    next_slab.slice_into(0, part2_len, dest[part1_len:])
+                    self.current_user_offset = end
+                    if next_aligned > self._last_scheduled_slab:
+                        self._last_scheduled_slab = next_aligned
+                        self._ensure_prefetch_window(end)
+                    return actual_req_len
+
+        async with self._async_lock:
+            self._ensure_prefetch_window(start)
+
+            curr = start
+            processed = 0
+
+            while curr < end:
+                aligned_start = (curr // self.slab_size) * self.slab_size
+                if aligned_start not in self.active_slabs:
+                    # Make room if needed
+                    window_end = aligned_start + (self.num_slabs * self.slab_size)
+                    self._evict_out_of_window_slabs(aligned_start, window_end)
+                    slab = await self.slab_pool.acquire(aligned_start)
+                    self.active_slabs[aligned_start] = slab
+                    slab.task = self.loop.create_task(self._fill_slab_parallel(slab))
+
+                slab = self.active_slabs[aligned_start]
+                await slab.ready_event.wait()
+                if slab.error:
+                    raise slab.error
+
+                rel_start = curr - slab.offset
+                avail = slab.valid_size - rel_start
+                if avail <= 0:
+                    break
+
+                take = min(avail, end - curr)
+                slab.slice_into(rel_start, rel_start + take, dest[processed : processed + take])
+                curr += take
+                processed += take
+
+            self.current_user_offset = curr
+            self._ensure_prefetch_window(curr)
+            return processed
+
+    async def afetch_into(self, start: int | None, buffer) -> int:
+        if start is None:
+            start = self.current_user_offset
+        if start >= self.size:
+            return 0
+        if self.is_stopped:
+            raise RuntimeError("The file instance has been closed.")
+
+        view = memoryview(buffer).cast("B")
+        if start + len(view) > self.size:
+            view = view[: max(0, self.size - start)]
+        if len(view) == 0:
+            return 0
+
+        logger.debug("Asynchronous afetch_into called for bounds start=%d, len=%d", start, len(view))
+        return await self._async_fetch_into(start, view)
+
+    def fetch_into(self, start: int | None, buffer) -> int:
+        if start is None:
+            start = self.current_user_offset
+        if start >= self.size:
+            return 0
+
+        view = memoryview(buffer).cast("B")
+        if start + len(view) > self.size:
+            view = view[: max(0, self.size - start)]
+        if len(view) == 0:
+            return 0
+
+        end = start + len(view)
+        actual_req_len = len(view)
+        logger.debug("Synchronous fetch_into called for bounds start=%d, end=%d", start, end)
+        self._update_streak(start, end)
+        if not self.is_stopped:
+            aligned_start = (start // self.slab_size) * self.slab_size
+            slab = self.active_slabs.get(aligned_start)
+            if slab is not None and slab.ready_event.is_set() and not slab.error:
+                rel_start = start - slab.offset
+                avail = slab.valid_size - rel_start
+                if avail >= actual_req_len:
+                    slab.slice_into(rel_start, rel_start + actual_req_len, view)
+                    self.current_user_offset = end
+                    logger.debug("Fast-path in-RAM slab cache hit for readinto [%d..%d]", start, end)
+                    if aligned_start > self._last_scheduled_slab and rel_start + actual_req_len >= (slab.valid_size // 2):
+                        self._last_scheduled_slab = aligned_start
+                        self.loop.call_soon_threadsafe(self._ensure_prefetch_window, end)
+                    return actual_req_len
+
+                next_aligned = aligned_start + self.slab_size
+                next_slab = self.active_slabs.get(next_aligned)
+                if next_slab is not None and next_slab.ready_event.is_set() and not next_slab.error:
+                    part1_len = slab.slice_into(rel_start, slab.valid_size, view)
+                    part2_len = actual_req_len - part1_len
+                    if next_slab.valid_size >= part2_len:
+                        next_slab.slice_into(0, part2_len, view[part1_len:])
+                        self.current_user_offset = end
+                        logger.debug("Fast-path multi-slab in-RAM hit for readinto [%d..%d]", start, end)
+                        if next_aligned > self._last_scheduled_slab:
+                            self._last_scheduled_slab = next_aligned
+                            self.loop.call_soon_threadsafe(self._ensure_prefetch_window, end)
+                        return actual_req_len
+
+        return fsspec.asyn.sync(self.loop, self.afetch_into, start, view)
 
     async def aclose(self):
         if self.is_stopped:

@@ -30,6 +30,8 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
+# By default, mute noisy library logs unless --debug is specified
+logging.basicConfig(format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logging.getLogger("gcsfs").setLevel(logging.ERROR)
 
 
@@ -112,11 +114,17 @@ def run_benchmark(
     iterations: int = 1,
     file_size_gb: float = 2.0,
     chunk_sizes_mb: list[int] | None = None,
+    buffer_sizes_mb: list[int] | None = None,
+    io_sizes_kb: list[int] | None = None,
     ttfb_ms: float = 0.0,
     bandwidth_mbps: float = 0.0,
     byte_latency_ns: float = 0.0,
     concurrency: int = 1,
     profile_enabled: bool = False,
+    engine: str = "all",
+    max_prefetch_mb: int = 256,
+    bucket_type: str = "all",
+    read_method: str = "both",
 ):
     os.environ["GCSFS_DUMMY_IO"] = "1"
     if ttfb_ms > 0:
@@ -147,18 +155,57 @@ def run_benchmark(
     fs.info = lambda path, **kwargs: fake_info_dict
 
     path = "demo-bucket/test-virtual-file.bin"
-    if chunk_sizes_mb is None:
-        chunk_sizes_mb = [1, 4, 5, 8, 16, 64]
 
-    modes = [
+    # Determine test pairs of (buffer_size_bytes, io_size_bytes)
+    test_pairs = []
+    if buffer_sizes_mb is not None and io_sizes_kb is not None:
+        for b_mb in buffer_sizes_mb:
+            for io_kb in io_sizes_kb:
+                test_pairs.append((b_mb * 1024 * 1024, io_kb * 1024, f"Buffer {b_mb}MB / IO {io_kb}KB", (b_mb, io_kb)))
+    elif io_sizes_kb is not None:
+        default_block_mb = 5
+        for io_kb in io_sizes_kb:
+            test_pairs.append((default_block_mb * 1024 * 1024, io_kb * 1024, f"Default 5MB / IO {io_kb}KB", (default_block_mb, io_kb)))
+    elif buffer_sizes_mb is not None:
+        for b_mb in buffer_sizes_mb:
+            test_pairs.append((b_mb * 1024 * 1024, b_mb * 1024 * 1024, f"{b_mb} MB", (b_mb, b_mb * 1024)))
+    elif chunk_sizes_mb is not None:
+        for c_mb in chunk_sizes_mb:
+            test_pairs.append((c_mb * 1024 * 1024, c_mb * 1024 * 1024, f"{c_mb} MB", (c_mb, c_mb * 1024)))
+    else:
+        for c_mb in [1, 4, 5, 8, 16, 64]:
+            test_pairs.append((c_mb * 1024 * 1024, c_mb * 1024 * 1024, f"{c_mb} MB", (c_mb, c_mb * 1024)))
+
+    all_modes = [
         ("Standard GCSFile (Regional)", BucketType.NON_HIERARCHICAL),
+        ("Rapid / Zonal (ZonalFile)", BucketType.ZONAL_HIERARCHICAL),
     ]
+    if bucket_type in ("rapid", "zonal", "zonal_hierarchical"):
+        modes = [all_modes[1]]
+    elif bucket_type in ("standard", "regional", "non_hierarchical"):
+        modes = [all_modes[0]]
+    else:
+        modes = all_modes
 
-    configs = [
-        # ("Direct Buffering (No Prefetch)", False, False, "none"),
+    all_configs = [
         ("Current BackgroundPrefetcher", True, False, "none"),
         ("ZeroCopySlabPrefetcher (Fixed Slab Pool + Parallel memoryview)", True, True, "none"),
     ]
+    if engine in ("slab", "zero_slab"):
+        configs = [all_configs[1]]
+    elif engine in ("background", "bg"):
+        configs = [all_configs[0]]
+    else:
+        configs = all_configs
+
+    if read_method == "all":
+        methods = ["read", "readinto_legacy", "readinto"]
+    elif read_method in ("both", "compare"):
+        methods = ["read", "readinto_legacy", "readinto"]
+    elif read_method in ("read", "readinto", "readinto_legacy"):
+        methods = [read_method]
+    else:
+        raise ValueError(f"Unknown read_method: {read_method}")
 
     tracker = ResourceTracker(interval=0.03)
 
@@ -175,7 +222,7 @@ def run_benchmark(
     print("=" * 115, flush=True)
     print(" GCSFS SINGLE-THREADED READ PATH THROUGHPUT BENCHMARK & CPU PROFILER ", flush=True)
     print("=" * 115, flush=True)
-    print(f" Virtual File Size: {file_size_gb:.1f} GB | Concurrency: {concurrency} | Iterations: {iterations} | Simulation: {', '.join(latency_desc)}", flush=True)
+    print(f" Virtual File Size: {file_size_gb:.1f} GB | Max Prefetch Window: {max_prefetch_mb} MB | Concurrency: {concurrency} | Iterations: {iterations} | Simulation: {', '.join(latency_desc)}", flush=True)
     print("=" * 115, flush=True)
 
     results = {}
@@ -189,98 +236,182 @@ def run_benchmark(
         for cfg_label, use_prefetch, use_slab, prefetch_cache_type in configs:
             print(f"\n  [ Configuration: {cfg_label} ]", flush=True)
 
-            for chunk_mb in chunk_sizes_mb:
-                chunk_bytes = chunk_mb * 1024 * 1024
+            for method in methods:
+                if method == "read":
+                    method_label = "read()"
+                elif method == "readinto_legacy":
+                    method_label = "readinto() [Legacy fsspec fallback: read() + memcpy]"
+                elif method == "readinto":
+                    method_label = "readinto() [Optimized Inherent fetch_into()]"
+                else:
+                    method_label = f"{method}()"
+                print(f"\n    -- Read Method: {method_label} --", flush=True)
 
-                open_kwargs = {
-                    "block_size": chunk_bytes,
-                    "slab_size": max(16 * 1024 * 1024, chunk_bytes),
-                    "cache_type": prefetch_cache_type,
-                    "use_experimental_adaptive_prefetching": use_prefetch,
-                    "use_slab_prefetcher": use_slab,
-                    "concurrency": concurrency,
-                    "dummy_io": True,
-                    "size": file_size_bytes,
-                }
+                for buf_bytes, io_bytes, pair_label, pair_key in test_pairs:
+                    max_prefetch_bytes = max_prefetch_mb * 1024 * 1024
+                    slab_size = max(16 * 1024 * 1024, buf_bytes)
+                    num_slabs = max(2, max_prefetch_bytes // slab_size)
 
-                prof = cProfile.Profile() if profile_enabled else None
+                    open_kwargs = {
+                        "block_size": buf_bytes,
+                        "slab_size": slab_size,
+                        "num_slabs": num_slabs,
+                        "max_prefetch_bytes": max_prefetch_bytes,
+                        "max_prefetch_size": max_prefetch_bytes,
+                        "cache_type": prefetch_cache_type,
+                        "use_experimental_adaptive_prefetching": use_prefetch,
+                        "use_slab_prefetcher": use_slab,
+                        "concurrency": concurrency,
+                        "dummy_io": True,
+                        "size": file_size_bytes,
+                    }
 
-                with fs.open(path, "rb", **open_kwargs) as f:
-                    tracker.start()
-                    if prof:
-                        prof.enable()
+                    prof = cProfile.Profile() if profile_enabled else None
 
-                    start_time = time.perf_counter()
-                    total_bytes_read = 0
-                    read_count = 0
+                    with fs.open(path, "rb", **open_kwargs) as f:
+                        tracker.start()
+                        if prof:
+                            prof.enable()
 
-                    for _ in range(iterations):
-                        f.seek(0)
-                        while True:
-                            data = f.read(chunk_bytes)
-                            if not data:
-                                break
-                            total_bytes_read += len(data)
-                            read_count += 1
+                        start_time = time.perf_counter()
+                        total_bytes_read = 0
+                        read_count = 0
 
-                    elapsed = time.perf_counter() - start_time
-                    if prof:
-                        prof.disable()
-                    tracker.stop()
+                        if method == "read":
+                            for _ in range(iterations):
+                                f.seek(0)
+                                while True:
+                                    data = f.read(io_bytes)
+                                    if not data:
+                                        break
+                                    total_bytes_read += len(data)
+                                    read_count += 1
+                        elif method == "readinto_legacy":
+                            # Emulate upstream fsspec AbstractBufferedFile.readinto
+                            buf = bytearray(io_bytes)
+                            out = memoryview(buf).cast("B")
+                            for _ in range(iterations):
+                                f.seek(0)
+                                while True:
+                                    data = f.read(len(out))
+                                    if not data:
+                                        break
+                                    out[: len(data)] = data
+                                    total_bytes_read += len(data)
+                                    read_count += 1
+                        elif method == "readinto":
+                            # Inherent native readinto with buffer reuse
+                            buf = bytearray(io_bytes)
+                            for _ in range(iterations):
+                                f.seek(0)
+                                while True:
+                                    n = f.readinto(buf)
+                                    if not n:
+                                        break
+                                    total_bytes_read += n
+                                    read_count += 1
 
-                    bytes_per_sec = total_bytes_read / max(1e-6, elapsed)
-                    results[(cfg_label, chunk_mb)] = bytes_per_sec
-                    speed_str = format_speed(bytes_per_sec)
+                        elapsed = time.perf_counter() - start_time
+                        if prof:
+                            prof.disable()
+                        tracker.stop()
 
-                    peak_mem = tracker.peak_mem_mb
-                    peak_cpu = tracker.max_cpu_percent
-                    avg_cpu = tracker.avg_cpu_percent
+                        bytes_per_sec = total_bytes_read / max(1e-6, elapsed)
+                        results[(mode_name, cfg_label, method, pair_key)] = bytes_per_sec
+                        results[(cfg_label, method, pair_key)] = bytes_per_sec
+                        speed_str = format_speed(bytes_per_sec)
 
-                    print(
-                        f"    Chunk Size: {chunk_mb:>3} MB | "
-                        f"Total Read Ops: {read_count:>7} | "
-                        f"Time: {elapsed:>6.3f}s | "
-                        f"Throughput: {speed_str:>10} | "
-                        f"Peak Mem: {peak_mem:>7.1f} MB | "
-                        f"Peak CPU: {peak_cpu:>5.1f}% (Avg: {avg_cpu:>5.1f}%)",
-                        flush=True,
-                    )
+                        peak_mem = tracker.peak_mem_mb
+                        peak_cpu = tracker.max_cpu_percent
+                        avg_cpu = tracker.avg_cpu_percent
 
-                    if prof:
-                        print(f"\n    --- Top 15 Functions by Cumulative Time (Chunk Size: {chunk_mb} MB) ---", flush=True)
-                        stats = pstats.Stats(prof)
-                        stats.strip_dirs().sort_stats("cumtime").print_stats(15)
-                        print("-" * 80, flush=True)
+                        print(
+                            f"      {pair_label:<24} | "
+                            f"Total Read Ops: {read_count:>7} | "
+                            f"Time: {elapsed:>6.3f}s | "
+                            f"Throughput: {speed_str:>10} | "
+                            f"Peak Mem: {peak_mem:>7.1f} MB | "
+                            f"Peak CPU: {peak_cpu:>5.1f}% (Avg: {avg_cpu:>5.1f}%)",
+                            flush=True,
+                        )
 
-    # Summary Comparison Table
-    print("\n" + "=" * 115, flush=True)
-    print(" SUMMARY THROUGHPUT COMPARISON ", flush=True)
-    print("=" * 115, flush=True)
-    header = f"{'Chunk Size':<12} | {'Direct Buffering':<20} | {'BackgroundPrefetcher':<22} | {'ZeroCopySlabPrefetcher':<24} | {'Winner & Speedup':<25}"
-    print(header)
-    print("-" * 115)
+                        if prof:
+                            print(f"\n      --- Top 15 Functions by Cumulative Time ({method}(), {pair_label}) ---", flush=True)
+                            stats = pstats.Stats(prof)
+                            stats.strip_dirs().sort_stats("cumtime").print_stats(15)
+                            print("-" * 80, flush=True)
 
-    for chunk_mb in chunk_sizes_mb:
-        direct_speed = results.get(("Direct Buffering (No Prefetch)", chunk_mb), 0.0)
-        bg_speed = results.get(("Current BackgroundPrefetcher", chunk_mb), 0.0)
-        slab_speed = results.get(("ZeroCopySlabPrefetcher (Fixed Slab Pool + Parallel memoryview)", chunk_mb), 0.0)
+    # Summary: READ vs READINTO Comparison Table
+    if len(methods) > 1:
+        print("\n" + "=" * 135, flush=True)
+        print(" READ vs READINTO (LEGACY vs OPTIMIZED) THROUGHPUT COMPARISON ", flush=True)
+        print("=" * 135, flush=True)
 
-        direct_str = format_speed(direct_speed) if direct_speed else "N/A"
-        bg_str = format_speed(bg_speed) if bg_speed else "N/A"
-        slab_str = format_speed(slab_speed) if slab_speed else "N/A"
+        for mode_name, _ in modes:
+            print(f"\n  [ Mode: {mode_name} ]", flush=True)
+            if io_sizes_kb is not None:
+                header = f"  {'Configuration':<26} | {'Buffer Size':<15} | {'IO Size':<9} | {'read()':<14} | {'readinto (Legacy)':<19} | {'readinto (Native)':<19} | {'Native vs Legacy':<18} | {'Native vs read':<15}"
+                print(header)
+                print("  " + "-" * 148)
 
-        if slab_speed > 0 and bg_speed > 0:
-            if slab_speed >= bg_speed:
-                pct = ((slab_speed - bg_speed) / bg_speed) * 100.0
-                winner_str = f"ZeroCopySlab (+{pct:.1f}%)"
+                b_mb_list = buffer_sizes_mb if buffer_sizes_mb is not None else [5]
+                for cfg_label, _, _, _ in configs:
+                    for b_mb in b_mb_list:
+                        for io_kb in io_sizes_kb:
+                            pair_key = (b_mb, io_kb)
+                            read_speed = results.get((mode_name, cfg_label, "read", pair_key), 0.0)
+                            legacy_speed = results.get((mode_name, cfg_label, "readinto_legacy", pair_key), 0.0)
+                            native_speed = results.get((mode_name, cfg_label, "readinto", pair_key), 0.0)
+
+                            read_str = format_speed(read_speed) if read_speed else "N/A"
+                            legacy_str = format_speed(legacy_speed) if legacy_speed else "N/A"
+                            native_str = format_speed(native_speed) if native_speed else "N/A"
+
+                            if native_speed > 0 and legacy_speed > 0:
+                                diff_leg = ((native_speed - legacy_speed) / legacy_speed) * 100.0
+                                leg_delta_str = f"{diff_leg:+.1f}%"
+                            else:
+                                leg_delta_str = "N/A"
+
+                            if native_speed > 0 and read_speed > 0:
+                                diff_read = ((native_speed - read_speed) / read_speed) * 100.0
+                                read_delta_str = f"{diff_read:+.1f}%"
+                            else:
+                                read_delta_str = "N/A"
+
+                            buf_str = f"{b_mb} MB" if buffer_sizes_mb is not None else f"Default ({b_mb}MB)"
+                            io_str = f"{io_kb} KB" if io_kb < 1024 else f"{io_kb // 1024} MB"
+                            row = f"  {cfg_label[:26]:<26} | {buf_str:<15} | {io_str:<9} | {read_str:<14} | {legacy_str:<19} | {native_str:<19} | {leg_delta_str:<18} | {read_delta_str:<15}"
+                            print(row)
             else:
-                pct = ((bg_speed - slab_speed) / slab_speed) * 100.0
-                winner_str = f"Background (+{pct:.1f}%)"
-        else:
-            winner_str = "N/A"
+                header = f"  {'Configuration':<26} | {'Chunk':<8} | {'read()':<14} | {'readinto (Legacy)':<19} | {'readinto (Native)':<19} | {'Native vs Legacy':<18} | {'Native vs read':<15}"
+                print(header)
+                print("  " + "-" * 128)
 
-        row = f"{str(chunk_mb) + ' MB':<12} | {direct_str:<20} | {bg_str:<22} | {slab_str:<24} | {winner_str:<25}"
-        print(row)
+                for cfg_label, _, _, _ in configs:
+                    for _, _, pair_label, pair_key in test_pairs:
+                        read_speed = results.get((mode_name, cfg_label, "read", pair_key), 0.0)
+                        legacy_speed = results.get((mode_name, cfg_label, "readinto_legacy", pair_key), 0.0)
+                        native_speed = results.get((mode_name, cfg_label, "readinto", pair_key), 0.0)
+
+                        read_str = format_speed(read_speed) if read_speed else "N/A"
+                        legacy_str = format_speed(legacy_speed) if legacy_speed else "N/A"
+                        native_str = format_speed(native_speed) if native_speed else "N/A"
+
+                        if native_speed > 0 and legacy_speed > 0:
+                            diff_leg = ((native_speed - legacy_speed) / legacy_speed) * 100.0
+                            leg_delta_str = f"{diff_leg:+.1f}%"
+                        else:
+                            leg_delta_str = "N/A"
+
+                        if native_speed > 0 and read_speed > 0:
+                            diff_read = ((native_speed - read_speed) / read_speed) * 100.0
+                            read_delta_str = f"{diff_read:+.1f}%"
+                        else:
+                            read_delta_str = "N/A"
+
+                        row = f"  {cfg_label[:26]:<26} | {pair_label:<8} | {read_str:<14} | {legacy_str:<19} | {native_str:<19} | {leg_delta_str:<18} | {read_delta_str:<15}"
+                        print(row)
 
     print("=" * 115 + "\n", flush=True)
 
@@ -306,8 +437,26 @@ if __name__ == "__main__":
         "--chunk-sizes",
         "-c",
         type=str,
-        default="1,4,5,8,16,64",
-        help="Comma-separated chunk sizes in MB (default: '1,4,5,8,16,64')",
+        default="",
+        help="Comma-separated chunk sizes in MB (e.g. '1,4,5,8,16,64')",
+    )
+    parser.add_argument(
+        "--buffer-sizes",
+        type=str,
+        default="",
+        help="Comma-separated buffer / block sizes in MB (e.g. '1,2,4,8')",
+    )
+    parser.add_argument(
+        "--io-sizes-kb",
+        type=str,
+        default="",
+        help="Comma-separated IO sizes in KB (e.g. '256,512,1024,2048')",
+    )
+    parser.add_argument(
+        "--io-sizes-mb",
+        type=str,
+        default="",
+        help="Comma-separated IO sizes in MB (e.g. '0.25,0.5,1,2')",
     )
     parser.add_argument(
         "--ttfb-ms",
@@ -338,16 +487,68 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable detailed cProfile function profiling breakdown",
     )
+    parser.add_argument(
+        "--engine",
+        type=str,
+        default="all",
+        choices=["all", "slab", "zero_slab", "background", "bg"],
+        help="Which prefetch engine to run ('all', 'slab', or 'background')",
+    )
+    parser.add_argument(
+        "--read-method",
+        type=str,
+        default="both",
+        choices=["both", "all", "read", "readinto"],
+        help="Which read method to benchmark: 'read' (allocate new bytes), 'readinto' (re-use buffer), or 'both' (default: 'both')",
+    )
+    parser.add_argument(
+        "--bucket-type",
+        "--mode",
+        type=str,
+        default="all",
+        choices=["all", "rapid", "zonal", "standard", "regional"],
+        help="Which bucket type to benchmark ('rapid', 'standard', or 'all')",
+    )
+    parser.add_argument(
+        "--max-prefetch-mb",
+        type=int,
+        default=256,
+        help="Maximum prefetch window size in MB (default: 256, e.g. 512, 1024)",
+    )
+    parser.add_argument(
+        "--debug",
+        "-d",
+        action="store_true",
+        help="Enable detailed DEBUG logging for prefetcher and gcsfs",
+    )
     args = parser.parse_args()
-    chunks = [int(x.strip()) for x in args.chunk_sizes.split(",") if x.strip()]
+    if args.debug:
+        logging.getLogger("gcsfs").setLevel(logging.DEBUG)
+        logging.getLogger("gcsfs.prefetcher").setLevel(logging.DEBUG)
+        logging.getLogger("gcsfs.slab_prefetcher").setLevel(logging.DEBUG)
+
+    chunks = [int(x.strip()) for x in args.chunk_sizes.split(",") if x.strip()] if args.chunk_sizes else None
+    buf_sizes = [int(x.strip()) for x in args.buffer_sizes.split(",") if x.strip()] if args.buffer_sizes else None
+    
+    io_sizes = None
+    if args.io_sizes_kb:
+        io_sizes = [int(x.strip()) for x in args.io_sizes_kb.split(",") if x.strip()]
+    elif args.io_sizes_mb:
+        io_sizes = [int(float(x.strip()) * 1024) for x in args.io_sizes_mb.split(",") if x.strip()]
 
     run_benchmark(
         iterations=args.iterations,
         file_size_gb=args.size_gb,
         chunk_sizes_mb=chunks,
+        buffer_sizes_mb=buf_sizes,
+        io_sizes_kb=io_sizes,
         ttfb_ms=args.ttfb_ms,
         bandwidth_mbps=args.bandwidth_mbps,
         byte_latency_ns=args.byte_latency_ns,
         concurrency=args.concurrency,
         profile_enabled=args.profile,
+        engine=args.engine,
+        max_prefetch_mb=args.max_prefetch_mb,
+        bucket_type=args.bucket_type,
+        read_method=args.read_method,
     )

@@ -37,6 +37,14 @@ except ImportError:
 logging.getLogger("gcsfs").setLevel(logging.ERROR)
 
 
+def _percentile(values: list[float], pct: float) -> float | None:
+    if not values:
+        return None
+    sorted_vals = sorted(values)
+    idx = int((len(sorted_vals) - 1) * pct)
+    return sorted_vals[idx]
+
+
 class ResourceTracker:
     """Background sampling thread to track peak RSS Memory and CPU % during a test round."""
     def __init__(self, interval: float = 0.05):
@@ -116,7 +124,10 @@ def run_network_benchmark(
     gcs_path: str,
     chunk_sizes_mb: list[int],
     iterations: int = 1,
+    concurrency: int | None = None,
     profile_enabled: bool = False,
+    per_read_metrics: bool = False,
+    network_only: bool = False,
     project: str | None = None,
     token: str | None = None,
 ):
@@ -150,9 +161,11 @@ def run_network_benchmark(
     print("=" * 120, flush=True)
     print(f" Target Object: gs://{clean_path}", flush=True)
     print(f" Remote File Size: {file_size_mb:.2f} MB ({file_size_gb:.2f} GB) | Iterations: {iterations} | Profile: {profile_enabled}", flush=True)
+    if concurrency is not None:
+        print(f" Concurrency: {concurrency}", flush=True)
     print("=" * 120, flush=True)
 
-    # Store results for final summary table: (config_label, chunk_mb) -> throughput_bytes_per_sec
+    # Store results for final summary table.
     results = {}
 
     for cfg_label, use_prefetch, use_slab, prefetch_cache_type in configs:
@@ -169,6 +182,8 @@ def run_network_benchmark(
                 "use_experimental_adaptive_prefetching": use_prefetch,
                 "use_slab_prefetcher": use_slab,
             }
+            if concurrency is not None:
+                open_kwargs["concurrency"] = concurrency
 
             prof = cProfile.Profile() if profile_enabled else None
 
@@ -182,16 +197,77 @@ def run_network_benchmark(
                     total_bytes_read = 0
                     read_count = 0
                     first_byte_time = None
+                    read_call_index = 0
+                    sampled_network_ttfb_ms = []
+                    sampled_network_stream_bps = []
+                    seen_request_metrics = None
 
                     for _ in range(iterations):
                         f.seek(0)
                         while True:
+                            read_call_index += 1
+                            prev_request_metrics = getattr(fs, "last_request_metrics", None)
                             t_before_chunk = time.perf_counter()
                             data = f.read(chunk_bytes)
+                            read_call_elapsed = time.perf_counter() - t_before_chunk
+                            latest_request_metrics = getattr(fs, "last_request_metrics", None)
+
+                            latest_metrics = latest_request_metrics
+                            if latest_metrics is not None and latest_metrics is not seen_request_metrics:
+                                ttfb_ms = latest_metrics.get("ttfb_ms")
+                                stream_bps = latest_metrics.get("stream_throughput_bps")
+
+                                # Backward-compatible fallback if stream_throughput_bps is absent.
+                                if stream_bps is None:
+                                    total_ms = latest_metrics.get("total_ms")
+                                    response_bytes = latest_metrics.get("response_bytes")
+                                    if (
+                                        ttfb_ms is not None
+                                        and total_ms is not None
+                                        and response_bytes is not None
+                                    ):
+                                        transfer_s = max(
+                                            1e-6,
+                                            (float(total_ms) - float(ttfb_ms)) / 1000.0,
+                                        )
+                                        stream_bps = int(response_bytes) / transfer_s
+
+                                if ttfb_ms is not None:
+                                    sampled_network_ttfb_ms.append(float(ttfb_ms))
+                                if stream_bps is not None:
+                                    sampled_network_stream_bps.append(float(stream_bps))
+                                seen_request_metrics = latest_metrics
+
                             if not data:
                                 break
                             if first_byte_time is None:
                                 first_byte_time = time.perf_counter() - t_before_chunk
+
+                            if per_read_metrics:
+                                req_ttfb_ms = None
+                                req_stream_bps = None
+
+                                if latest_request_metrics is not None and latest_request_metrics is not prev_request_metrics:
+                                    req_ttfb_ms = latest_request_metrics.get("ttfb_ms")
+                                    req_stream_bps = latest_request_metrics.get("stream_throughput_bps")
+
+                                req_ttfb_str = (
+                                    f"{float(req_ttfb_ms):.1f}ms"
+                                    if req_ttfb_ms is not None
+                                    else "prefetched"
+                                )
+                                req_stream_str = (
+                                    format_speed(req_stream_bps)
+                                    if req_stream_bps is not None and req_stream_bps > 0
+                                    else "prefetched"
+                                )
+
+                                print(
+                                    f"      Read#{read_call_index:>4} | "
+                                    f"TTFB: {req_ttfb_str:>10} | "
+                                    f"StreamThroughput: {req_stream_str}",
+                                    flush=True,
+                                )
 
                             total_bytes_read += len(data)
                             read_count += 1
@@ -202,24 +278,77 @@ def run_network_benchmark(
                     tracker.stop()
 
                     bytes_per_sec = total_bytes_read / max(1e-6, elapsed)
-                    results[(cfg_label, chunk_mb)] = bytes_per_sec
-
                     speed_str = format_speed(bytes_per_sec)
                     ttfb_str = f"{first_byte_time * 1000:.1f} ms" if first_byte_time else "N/A"
+                    transfer_elapsed = max(0.0, elapsed - (first_byte_time or 0.0))
+                    transfer_bytes_per_sec = (
+                        total_bytes_read / max(1e-6, transfer_elapsed)
+                        if transfer_elapsed > 0
+                        else 0.0
+                    )
+                    transfer_speed_str = (
+                        format_speed(transfer_bytes_per_sec)
+                        if transfer_bytes_per_sec > 0
+                        else "N/A"
+                    )
+                    net_ttfb_first = sampled_network_ttfb_ms[0] if sampled_network_ttfb_ms else None
+                    net_ttfb_avg = (
+                        sum(sampled_network_ttfb_ms) / len(sampled_network_ttfb_ms)
+                        if sampled_network_ttfb_ms
+                        else None
+                    )
+                    net_ttfb_p50 = _percentile(sampled_network_ttfb_ms, 0.50)
+                    net_ttfb_p90 = _percentile(sampled_network_ttfb_ms, 0.90)
+                    net_stream_avg = (
+                        sum(sampled_network_stream_bps) / len(sampled_network_stream_bps)
+                        if sampled_network_stream_bps
+                        else None
+                    )
+                    net_stream_p50 = _percentile(sampled_network_stream_bps, 0.50)
+                    net_stream_p90 = _percentile(sampled_network_stream_bps, 0.90)
+
+                    net_ttfb_str = (
+                        f"avg={net_ttfb_avg:.1f}ms p50={net_ttfb_p50:.1f}ms p90={net_ttfb_p90:.1f}ms "
+                        f"(samples={len(sampled_network_ttfb_ms)})"
+                        if net_ttfb_avg is not None and net_ttfb_p50 is not None and net_ttfb_p90 is not None
+                        else "N/A"
+                    )
+                    net_stream_str = (
+                        f"avg={format_speed(net_stream_avg)} p50={format_speed(net_stream_p50)} p90={format_speed(net_stream_p90)} "
+                        f"(samples={len(sampled_network_stream_bps)})"
+                        if net_stream_avg is not None and net_stream_p50 is not None and net_stream_p90 is not None
+                        else "N/A"
+                    )
+                    results[(cfg_label, chunk_mb)] = {
+                        "e2e_bps": bytes_per_sec,
+                        "stream_p50_bps": net_stream_p50,
+                        "stream_p90_bps": net_stream_p90,
+                        "net_ttfb": net_ttfb_str,
+                        "net_stream": net_stream_str,
+                    }
                     peak_mem = tracker.peak_mem_mb
                     peak_cpu = tracker.max_cpu_percent
                     avg_cpu = tracker.avg_cpu_percent
 
-                    print(
-                        f"    Chunk: {chunk_mb:>3} MB | "
-                        f"Total Read Ops: {read_count:>6} | "
-                        f"Time: {elapsed:>6.3f}s | "
-                        f"TTFB: {ttfb_str:>8} | "
-                        f"Throughput: {speed_str:>10} | "
-                        f"Peak RAM: {peak_mem:>7.1f} MB | "
-                        f"Peak CPU: {peak_cpu:>5.1f}%",
-                        flush=True,
-                    )
+                    if network_only:
+                        print(
+                            f"    Chunk: {chunk_mb:>3} MB | "
+                            f"TTFB: {net_ttfb_str} | "
+                            f"StreamThroughput: {net_stream_str}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"    Chunk: {chunk_mb:>3} MB | "
+                            f"Total Read Ops: {read_count:>6} | "
+                            f"Time: {elapsed:>6.3f}s | "
+                            f"Throughput(E2E): {speed_str:>10} | "
+                            f"TTFB(Request): {net_ttfb_str} | "
+                            f"StreamThroughput: {net_stream_str} | "
+                            f"Peak RAM: {peak_mem:>7.1f} MB | "
+                            f"Peak CPU: {peak_cpu:>5.1f}%",
+                            flush=True,
+                        )
 
                     if prof:
                         print(f"\n    --- Top 15 Functions by Cumulative Time (Chunk: {chunk_mb} MB) ---", flush=True)
@@ -232,20 +361,47 @@ def run_network_benchmark(
 
     # Print Comparative Summary Table
     print("\n" + "=" * 120, flush=True)
-    print(" SUMMARY THROUGHPUT COMPARISON ", flush=True)
+    if network_only:
+        print(" SUMMARY REQUEST METRICS (P50/P90) ", flush=True)
+    else:
+        print(" SUMMARY THROUGHPUT COMPARISON ", flush=True)
     print("=" * 120, flush=True)
-    header = f"{'Chunk Size':<12} | {'Direct Buffering':<20} | {'BackgroundPrefetcher':<22} | {'ZeroCopySlabPrefetcher':<24} | {'Winner & Speedup':<25}"
+    if network_only:
+        header = f"{'Chunk Size':<12} | {'Background TTFB':<34} | {'Background StreamThroughput':<42} | {'ZeroCopy TTFB':<34} | {'ZeroCopy StreamThroughput':<42}"
+    else:
+        header = f"{'Chunk Size':<12} | {'Direct Buffering':<20} | {'BackgroundPrefetcher':<22} | {'ZeroCopySlabPrefetcher':<24} | {'Winner & Speedup':<25}"
     print(header)
     print("-" * 120)
 
     for chunk_mb in chunk_sizes_mb:
-        direct_speed = results.get(("Direct Buffering (No Prefetch)", chunk_mb), 0.0)
-        bg_speed = results.get(("Current BackgroundPrefetcher", chunk_mb), 0.0)
-        slab_speed = results.get(("ZeroCopySlabPrefetcher (Fixed Slab Pool + Zero-Copy)", chunk_mb), 0.0)
+        direct_entry = results.get(("Direct Buffering (No Prefetch)", chunk_mb), {})
+        bg_entry = results.get(("Current BackgroundPrefetcher", chunk_mb), {})
+        slab_entry = results.get(("ZeroCopySlabPrefetcher (Fixed Slab Pool + Zero-Copy)", chunk_mb), {})
+
+        direct_speed = direct_entry.get("e2e_bps", 0.0)
+        bg_speed = bg_entry.get("e2e_bps", 0.0)
+        slab_speed = slab_entry.get("e2e_bps", 0.0)
+        bg_stream_p50 = bg_entry.get("stream_p50_bps", 0.0)
+        slab_stream_p50 = slab_entry.get("stream_p50_bps", 0.0)
+        bg_ttfb_str = bg_entry.get("net_ttfb", "N/A")
+        slab_ttfb_str = slab_entry.get("net_ttfb", "N/A")
+        bg_stream_str = bg_entry.get("net_stream", "N/A")
+        slab_stream_str = slab_entry.get("net_stream", "N/A")
 
         direct_str = format_speed(direct_speed) if direct_speed else "N/A"
         bg_str = format_speed(bg_speed) if bg_speed else "N/A"
         slab_str = format_speed(slab_speed) if slab_speed else "N/A"
+
+        if network_only:
+            row = (
+                f"{str(chunk_mb) + ' MB':<12} | "
+                f"{bg_ttfb_str:<34} | "
+                f"{bg_stream_str:<42} | "
+                f"{slab_ttfb_str:<34} | "
+                f"{slab_stream_str:<42}"
+            )
+            print(row)
+            continue
 
         if slab_speed > 0 and bg_speed > 0:
             if slab_speed >= bg_speed:
@@ -271,7 +427,7 @@ if __name__ == "__main__":
         "--path",
         "-p",
         type=str,
-        required=True,
+        default="gs://princer-bucket/1gfile.bin",
         help="GCS URI/path to real object (e.g. 'gs://bucket-name/file.bin' or 'bucket-name/file.bin').",
     )
     parser.add_argument(
@@ -287,6 +443,12 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of iterations to read the complete file (default: 1).",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        help="Override the read concurrency passed to fs.open (optional).",
     )
     parser.add_argument(
         "--project",
@@ -305,6 +467,22 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable cProfile and output top 15 cumulative time CPU hotspots.",
     )
+    parser.add_argument(
+        "--per-read-metrics",
+        action="store_true",
+        help=(
+            "Print per f.read call request metrics including request TTFB and "
+            "request stream throughput excluding TTFB time."
+        ),
+    )
+    parser.add_argument(
+        "--network-only",
+        action="store_true",
+        help=(
+            "Show only network-focused metrics (request TTFB and network transfer "
+            "throughput), excluding application-level throughput lines."
+        ),
+    )
 
     args = parser.parse_args()
     chunks = [int(x.strip()) for x in args.chunk_sizes.split(",") if x.strip()]
@@ -313,7 +491,10 @@ if __name__ == "__main__":
         gcs_path=args.path,
         chunk_sizes_mb=chunks,
         iterations=args.iterations,
+        concurrency=args.concurrency,
         profile_enabled=args.profile,
+        per_read_metrics=args.per_read_metrics,
+        network_only=args.network_only,
         project=args.project,
         token=args.token,
     )

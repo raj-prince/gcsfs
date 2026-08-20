@@ -1258,6 +1258,8 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if start >= end:
             return b""
 
+        # print(f"_cat_file_concurrent {start}, {end}", flush=True)
+
         ranges = split_range(
             end - start, concurrency, self.MIN_CHUNK_SIZE_FOR_CONCURRENCY
         )
@@ -2683,6 +2685,7 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
 
     async def _async_fetch_range(self, start_offset, total_size, split_factor=1):
         """Async fetcher mapped to the Prefetcher engine for regional buckets."""
+        # print(f"_async_fetch_range {start_offset}, {total_size}, {split_factor}", flush=True)
         return await self.gcsfs._cat_file_concurrent(
             self.path,
             start=start_offset,
@@ -2690,6 +2693,45 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
             concurrency=split_factor,
             cache_type=self.cache_type,
         )
+
+    def readinto(self, b):
+        """Read bytes into a pre-allocated, writable bytes-like object b.
+
+        Overrides fsspec.spec.AbstractBufferedFile.readinto to bypass intermediate
+        allocations and copy directly into the destination buffer.
+        """
+        if self.mode != "rb":
+            raise ValueError("File not in read mode")
+        if self.closed:
+            raise ValueError("I/O operation on closed file.")
+
+        out = memoryview(b).cast("B")
+        if len(out) == 0:
+            return 0
+
+        if self.size is not None:
+            remaining = max(0, self.size - self.loc)
+            if len(out) > remaining:
+                out = out[:remaining]
+            if len(out) == 0:
+                return 0
+
+        if hasattr(self, "_prefetch_engine") and self._prefetch_engine and hasattr(self._prefetch_engine, "fetch_into"):
+            nbytes = self._prefetch_engine.fetch_into(self.loc, out)
+            self.loc += nbytes
+            return nbytes
+
+        if hasattr(self.cache, "_fetch_into"):
+            nbytes = self.cache._fetch_into(self.loc, out)
+            self.loc += nbytes
+            return nbytes
+
+        data = self.read(len(out))
+        out[: len(data)] = data
+        return len(data)
+
+    def readinto1(self, b):
+        return self.readinto(b)
 
     def close(self):
         super().close()

@@ -2904,6 +2904,52 @@ def test_gcsfile_not_satisfiable_range(gcs):
         assert res == b""
 
 
+def test_gcsfile_readinto_with_prefetcher(gcs):
+    fn = f"{TEST_BUCKET}/integrated_readinto.txt"
+    file_size = 5 * 1024 * 1024
+    data = os.urandom(file_size)
+    gcs.pipe(fn, data)
+
+    with gcs.open(
+        fn, "rb", use_experimental_adaptive_prefetching=True, block_size=1024 * 1024
+    ) as f:
+        buf = bytearray(512 * 1024)
+        read_total = 0
+        while read_total < file_size:
+            n = f.readinto(buf)
+            if n == 0:
+                break
+            assert bytes(buf[:n]) == data[read_total : read_total + n]
+            read_total += n
+        assert read_total == file_size
+
+        # EOF
+        assert f.readinto(buf) == 0
+
+
+def test_gcsfile_readinto_without_prefetcher(gcs):
+    fn = f"{TEST_BUCKET}/integrated_readinto_noprefetch.txt"
+    file_size = 2 * 1024 * 1024
+    data = os.urandom(file_size)
+    gcs.pipe(fn, data)
+
+    with gcs.open(
+        fn, "rb", use_experimental_adaptive_prefetching=False, block_size=512 * 1024
+    ) as f:
+        buf = bytearray(256 * 1024)
+        read_total = 0
+        while read_total < file_size:
+            n = f.readinto(buf)
+            if n == 0:
+                break
+            assert bytes(buf[:n]) == data[read_total : read_total + n]
+            read_total += n
+        assert read_total == file_size
+
+        # EOF
+        assert f.readinto(buf) == 0
+
+
 def test_tree(gcs):
     unique_id = uuid.uuid4().hex
     base_dir = f"{TEST_BUCKET}/test_tree_regional_{unique_id}"
