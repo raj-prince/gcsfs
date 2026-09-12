@@ -28,16 +28,44 @@ from fsspec.callbacks import NoOpCallback
 from fsspec.implementations.http import get_client
 from fsspec.utils import other_paths, setup_logging, stringify_path
 
+from concurrent.futures import ThreadPoolExecutor
+from google.api_core import exceptions as api_exceptions
+from google.api_core.client_info import ClientInfo
+from google.api_core.client_options import ClientOptions
+from google.cloud import storage_control_v2
+from google.cloud.storage.asyncio.async_grpc_client import AsyncGrpcClient
+
 from . import __version__ as version
-from ._dircache import DirCacheUpdater
+from ._dircache import HnsDirCacheUpdater
 from .checkers import get_consistency_checker
 from .concurrency import parallel_tasks_first_completed, split_range
 from .credentials import GoogleCredentials
+from .drivers.base import BaseBucketDriver, BucketType
+from .drivers.flat import FlatBucketDriver
+from .drivers.hns import HnsBucketDriver
+from .drivers.zonal import (
+    ZonalBucketDriver,
+    _get_mrd_from_pool_or_mrd,
+    _get_mrd_size,
+)
 from .inventory_report import InventoryReport
-from .retry import errs, retry_request, validate_response
-from .zb_hns_utils import DEFAULT_CONCURRENCY, MAX_PREFETCH_SIZE, _on_loop_thread
+from .retry import (
+    DEFAULT_RETRY_CONFIG,
+    errs,
+    get_storage_control_retry_config,
+    retry_request,
+    validate_response,
+)
+from .zb_hns_utils import (
+    DEFAULT_CONCURRENCY,
+    MAX_PREFETCH_SIZE,
+    DirectMemmoveBuffer,
+    _on_loop_thread,
+)
 
 logger = logging.getLogger("gcsfs")
+USER_AGENT = "python-gcsfs"
+STORAGE_CONTROL_RPC_TIMEOUT = 30.0
 
 
 if "GCSFS_DEBUG" in os.environ:
@@ -194,7 +222,7 @@ def _get_cache_type_header_value(cache_type, cache_source=None):
     return f"cache_type/{cache_type}{suffix}"
 
 
-class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
+class GCSFileSystem(HnsDirCacheUpdater, asyn.AsyncFileSystem):
     r"""
     Connect to Google Cloud Storage.
 
@@ -375,6 +403,43 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             project, access, token, on_google=self.on_google
         )
 
+        valid_keys = DEFAULT_RETRY_CONFIG.keys()
+        self.retry_config = {
+            k[6:]: v
+            for k, v in kwargs.items()
+            if k.startswith("retry_") and k[6:] in valid_keys and v is not None
+        }
+        self.finalize_on_close = kwargs.get("finalize_on_close", False)
+        self._grpc_client = None
+        self._storage_control_client = None
+        self.credential = self.credentials.credentials
+        if self.credentials.token == "anon":
+            from google.auth.credentials import AnonymousCredentials
+
+            self.credential = AnonymousCredentials()
+        self._storage_layout_cache = {}
+        self._drivers = {}
+        self._default_drivers = {}
+        self._memmove_executor = ThreadPoolExecutor(
+            max_workers=kwargs.get("memmove_max_workers", 8)
+        )
+        weakref.finalize(self, self._memmove_executor.shutdown)
+        mrd_pool_cache_size = kwargs.get("mrd_pool_cache_size", 16)
+        max_mrd_pool_cache_queue_size = kwargs.get("max_mrd_pool_cache_queue_size", 8)
+        from . import zb_hns_utils
+
+        self._mrd_pool_cache = zb_hns_utils.MRDPoolCache(
+            self,
+            max_idle_pools=mrd_pool_cache_size,
+            max_queue_size=max_mrd_pool_cache_queue_size,
+        )
+        weakref.finalize(
+            self,
+            self._finalize_mrd_pool_cache,
+            self.loop,
+            self._mrd_pool_cache,
+        )
+
     @property
     def _location(self):
         return self._endpoint or _location()
@@ -391,11 +456,370 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
     def project(self):
         return self.credentials.project
 
-    # This threshold applies to the standard bucket, whereas the zonal bucket
-    # uses a 5MB threshold. This difference exists because the standard bucket
-    # lacks the `DirectMemmoveBuffer` implementation used in the zonal bucket.
+    @property
+    def _user_project(self):
+        """Value used for billing - enabling "requestor pays" access"""
+        if self.requester_pays:
+            return (
+                self.requester_pays
+                if isinstance(self.requester_pays, str)
+                else self.project
+            )
+        return None
+
+    def _get_retry_config(self, **kwargs):
+        return get_storage_control_retry_config(self.retry_config, **kwargs)
+
+    @property
+    def grpc_client(self):
+        if self.asynchronous and self._grpc_client is None:
+            raise RuntimeError(
+                "Please await _get_grpc_client() before accessing grpc_client"
+            )
+        if self._grpc_client is None:
+            self._grpc_client = asyn.sync(self.loop, self._get_grpc_client)
+        return self._grpc_client
+
+    async def _get_grpc_client(self):
+        if self._grpc_client is None:
+            client_options = ClientOptions(quota_project_id=self._user_project)
+            if self._location:
+                endpoint = self._location.split("://")[-1].split("/")[0]
+                client_options.api_endpoint = endpoint
+            self._grpc_client = AsyncGrpcClient(
+                credentials=self.credential,
+                client_info=ClientInfo(user_agent=f"{USER_AGENT}/{version}"),
+                client_options=client_options,
+            )
+        return self._grpc_client
+
+    async def _get_control_plane_client(self):
+        if self._storage_control_client is None:
+            transport_cls = (
+                storage_control_v2.StorageControlAsyncClient.get_transport_class(
+                    "grpc_asyncio"
+                )
+            )
+            channel_kwargs = {
+                "credentials": self.credential,
+                "options": [("grpc.primary_user_agent", f"{USER_AGENT}/{version}")],
+                "quota_project_id": self._user_project,
+            }
+            if self._location:
+                endpoint = self._location.split("://")[-1].split("/")[0]
+                channel_kwargs["host"] = endpoint
+
+            channel = transport_cls.create_channel(**channel_kwargs)
+            transport = transport_cls(channel=channel)
+            self._storage_control_client = storage_control_v2.StorageControlAsyncClient(
+                transport=transport
+            )
+        return self._storage_control_client
+
+    async def _close_resources(self):
+        if self._mrd_pool_cache is not None:
+            try:
+                await self._mrd_pool_cache.close()
+            except Exception as e:
+                logger.warning(f"Failed to close MRDPoolCache: {e}")
+        if self._storage_control_client is not None:
+            try:
+                await self._storage_control_client.transport.close()
+            except Exception as e:
+                logger.warning(f"Failed to close storage_control_client: {e}")
+            self._storage_control_client = None
+        if self._grpc_client is not None:
+            try:
+                await self._grpc_client.grpc_client.transport.close()
+            except Exception as e:
+                logger.warning(f"Failed to close grpc_client: {e}")
+            self._grpc_client = None
+
+    @staticmethod
+    def _finalize_mrd_pool_cache(loop, cache):
+        if cache is None or getattr(cache, "_closed", False):
+            return
+
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(cache.close(), loop)
+        elif current_loop is not None and current_loop.is_running():
+            asyncio.run_coroutine_threadsafe(cache.close(), current_loop)
+        elif asyn.loop[0] is not None and asyn.loop[0].is_running():
+            try:
+                asyn.sync(asyn.loop[0], cache.close, timeout=5.0)
+            except fsspec.FSTimeoutError:
+                pass
+
+    async def _lookup_bucket_type(self, bucket):
+        if bucket in self._storage_layout_cache:
+            return self._storage_layout_cache[bucket]
+        bucket_type = await self._get_bucket_type(bucket)
+        if bucket_type == BucketType.UNKNOWN:
+            return bucket_type
+        self._storage_layout_cache[bucket] = bucket_type
+        return self._storage_layout_cache[bucket]
+
+    _sync_lookup_bucket_type = asyn.sync_wrapper(_lookup_bucket_type)
+
+    async def _get_bucket_type(self, bucket):
+        try:
+            client = await self._get_control_plane_client()
+            bucket_name_value = f"projects/_/buckets/{bucket}/storageLayout"
+            logger.debug(f"get_storage_layout request for name: {bucket_name_value}")
+            response = await client.get_storage_layout(
+                name=bucket_name_value,
+                retry=self._get_retry_config(),
+                timeout=STORAGE_CONTROL_RPC_TIMEOUT,
+            )
+
+            if response.location_type == "zone":
+                return BucketType.ZONAL_HIERARCHICAL
+            if (
+                response.hierarchical_namespace
+                and response.hierarchical_namespace.enabled
+            ):
+                return BucketType.HIERARCHICAL
+            return BucketType.NON_HIERARCHICAL
+        except api_exceptions.NotFound:
+            logger.warning(
+                f"Error: Bucket {bucket} not found or you lack permissions for "
+                f"storage layout api used to detect bucket type. Falling back to GCSFileSystem."
+            )
+            return BucketType.UNKNOWN
+        except Exception as e:
+            logger.warning(
+                f"Could not determine bucket type for bucket name {bucket}: {e}, falling back to GCSFileSystem"
+            )
+            return BucketType.UNKNOWN
+
+    async def _is_zonal_bucket(self, bucket):
+        bucket_type = await self._lookup_bucket_type(bucket)
+        return bucket_type == BucketType.ZONAL_HIERARCHICAL
+
+    async def _is_bucket_hns_enabled(self, bucket):
+        try:
+            bucket_type = await self._lookup_bucket_type(bucket)
+        except Exception as e:
+            logger.warning(
+                f"Could not determine if bucket '{bucket}' is HNS-enabled, falling back to default non-HNS: {e}",
+                stack_info=True,
+            )
+            return False
+        return bucket_type in (BucketType.ZONAL_HIERARCHICAL, BucketType.HIERARCHICAL)
+
+    async def _get_driver(self, bucket: str) -> BaseBucketDriver:
+        if not bucket:
+            return self._get_driver_by_type(BucketType.NON_HIERARCHICAL)
+        if bucket in self._drivers:
+            return self._drivers[bucket]
+        btype = await self._lookup_bucket_type(bucket)
+        driver = self._get_driver_by_type(btype)
+        if btype != BucketType.UNKNOWN:
+            self._drivers[bucket] = driver
+        return driver
+
+    def _get_driver_by_type(self, btype: BucketType) -> BaseBucketDriver:
+        if btype not in self._default_drivers:
+            self._default_drivers[btype] = self._create_driver_for_type(btype)
+        return self._default_drivers[btype]
+
+    def _create_driver_for_type(self, btype: BucketType) -> BaseBucketDriver:
+        if btype == BucketType.ZONAL_HIERARCHICAL:
+            return ZonalBucketDriver(self)
+        elif btype == BucketType.HIERARCHICAL:
+            return HnsBucketDriver(self)
+        else:
+            return FlatBucketDriver(self)
+
     async def _get_threshold_for_disk_reads(self, bucket):
+        if await self._is_zonal_bucket(bucket):
+            return 5 * 1024 * 1024
         return 100 * 1024 * 1024
+
+    @staticmethod
+    def _resolve_cache_config(kwargs):
+        kwargs = kwargs or {}
+        cache_type = kwargs.get("cache_type")
+        cache_source = kwargs.get("cache_source")
+        if not cache_type or not cache_source:
+            cache_type, _, cache_source = _get_prefetcher_and_cache_config(
+                cache_type, kwargs
+            )
+        return cache_type, cache_source
+
+    async def _process_limits_to_offset_and_length(
+        self, path, start, end, file_size=None
+    ):
+        size = file_size
+
+        async def _get_size():
+            nonlocal size
+            if size is None:
+                size = (await self._info(path))["size"]
+            return size
+
+        if start is None:
+            offset = 0
+        elif start < 0:
+            offset = max(0, await _get_size() + start)
+        else:
+            offset = start
+
+        if end is None:
+            effective_end = await _get_size()
+        elif end < 0:
+            effective_end = await _get_size() + end
+        else:
+            effective_end = end
+
+        if effective_end <= offset:
+            return offset, 0
+        else:
+            length = effective_end - offset
+            s = await _get_size()
+            if effective_end > s:
+                length = max(0, s - offset)
+
+        return offset, length
+
+    sync_process_limits_to_offset_and_length = asyn.sync_wrapper(
+        _process_limits_to_offset_and_length
+    )
+
+    async def _fetch_range_split(
+        self,
+        path,
+        start,
+        chunk_lengths,
+        concurrency,
+        mrd=None,
+        size=None,
+        **kwargs,
+    ):
+        file_size = size or await _get_mrd_size(mrd)
+        if file_size is None:
+            logger.warning(
+                f"AsyncMultiRangeDownloader (MRD) for {path} has no 'persisted_size'. "
+                "Falling back to _info() to get the file size."
+            )
+            file_size = (await self._info(path))["size"]
+
+        start_offset = start if start is not None else 0
+        if start_offset >= file_size or start_offset + sum(chunk_lengths) > file_size:
+            raise RuntimeError("Request not satisfiable.")
+
+        pool_created_here = False
+        bucket, object_name, generation = self.split_path(path)
+        cache_type, cache_source = self._resolve_cache_config(kwargs)
+
+        if mrd is None:
+            pool_size = min(len(chunk_lengths), concurrency)
+            mrd = await self._mrd_pool_cache.get(
+                bucket,
+                object_name,
+                generation,
+                pool_size=pool_size,
+                cache_type=cache_type,
+                cache_source=cache_source,
+            )
+            pool_created_here = True
+
+        tasks = []
+        try:
+            current_offset = start_offset
+            cat_kwargs = kwargs.copy()
+            cat_kwargs["cache_type"] = cache_type
+            cat_kwargs["cache_source"] = cache_source
+
+            for length in chunk_lengths:
+                end_offset = current_offset + length
+                tasks.append(
+                    asyncio.create_task(
+                        self._cat_file(
+                            path,
+                            start=current_offset,
+                            end=end_offset,
+                            mrd=mrd,
+                            concurrency=max(
+                                1, length * concurrency // sum(chunk_lengths)
+                            ),
+                            **cat_kwargs,
+                        )
+                    )
+                )
+                current_offset = end_offset
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, Exception):
+                    raise res
+
+            return results
+        except BaseException:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        finally:
+            if pool_created_here:
+                await mrd.close()
+
+    async def _concurrent_mrd_fetch(self, offset, length, concurrency, mrd_or_pool):
+        ranges = split_range(length, concurrency, self.MIN_CHUNK_SIZE_FOR_CONCURRENCY)
+        tasks = []
+        views = []
+        has_error = False
+
+        master_buffer = DirectMemmoveBuffer(length, self._memmove_executor)
+
+        async def _download(o, s, view, mrd_or_pool):
+            async with _get_mrd_from_pool_or_mrd(mrd_or_pool) as m_client:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"mrd path: {m_client.object_name} | "
+                        f"Requested range: [({o}, {s})]"
+                    )
+                await m_client.download_ranges([(o, s, view)])
+
+        for relative_offset, actual_size in ranges:
+            part_offset = offset + relative_offset
+            view = master_buffer.get_view(part_offset - offset, actual_size)
+            views.append(view)
+            tasks.append(
+                asyncio.create_task(
+                    _download(part_offset, actual_size, view, mrd_or_pool)
+                )
+            )
+
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, Exception):
+                    has_error = True
+                    raise res
+            for view in views:
+                view.close()
+        except BaseException:
+            has_error = True
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        finally:
+            try:
+                master_buffer.close()
+            except Exception:
+                if not has_error:
+                    raise
+
+        return master_buffer.get_value()
 
     # Clean up the aiohttp session
     #
@@ -647,7 +1071,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 raise FileNotFoundError(path)
         return self._process_object(bucket, res)
 
-    async def _list_objects(self, path, prefix="", versions=False, **kwargs):
+    async def _list_objects_impl(self, path, prefix="", versions=False, **kwargs):
         bucket, key, generation = self.split_path(path)
         path = path.rstrip("/")
 
@@ -705,6 +1129,21 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if not prefix and not use_snapshot_listing and not max_results:
             self.dircache[path] = out
         return out
+
+    async def _list_objects(self, path, prefix="", versions=False, **kwargs):
+        try:
+            return await self._list_objects_impl(
+                path, prefix=prefix, versions=versions, **kwargs
+            )
+        except FileNotFoundError:
+            bucket, key, _ = self.split_path(path)
+            if key and await self._is_bucket_hns_enabled(bucket):
+                try:
+                    await self._get_directory_info(path, bucket, key, None)
+                    return []
+                except (FileNotFoundError, Exception):
+                    pass
+            raise
 
     async def _do_list_objects(
         self,
@@ -963,7 +1402,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 self.dircache.pop(path, None)
                 path = self._parent(path)
 
-    async def _mkdir(
+    async def _mkdir_flat(
         self,
         path,
         acl="projectPrivate",
@@ -981,40 +1420,6 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         If path is more than just a bucket, will create bucket if create_parents=True;
         otherwise is a noop. If create_parents is False and bucket does not exist,
         will produce FileNotFoundError.
-
-        Parameters
-        ----------
-        path: str
-            bucket name. If contains '/' (i.e., looks like subdir), will
-            have no effect because GCS doesn't have real directories.
-        acl: string, one of bACLs
-            access for the bucket itself. See:
-            https://cloud.google.com/storage/docs/access-control/lists#predefined-acl
-        default_acl: str, one of ACLs
-            default ACL for objects created in this bucket
-        location: Optional[str]
-            Location where buckets are created, like 'US' or 'EUROPE-WEST3'.
-            If not provided, defaults to `self.default_location`.
-            You can find a list of all available locations here:
-            https://cloud.google.com/storage/docs/locations#available-locations
-        create_parents: bool
-            If True, creates the bucket in question, if it doesn't already exist
-        enable_versioning: bool
-            If True, creates the bucket in question with object versioning
-            enabled.
-        enable_object_retention: bool
-            If True, creates the bucket in question with object retention
-            permanently enabled.
-        iam_configuration: dict
-            If provided, sets the IAM policy for the bucket. This argument
-            allows setting properties such as `{publicAccessPrevention: "enforced"}`
-            and `{"uniformBucketLevelAccess": {"enabled": True}}`. If passed, `acl`
-            and `default_acl` are explicitly ignored.
-        **kwargs
-            Additional parameters passed to the API call request body. See:
-            https://cloud.google.com/storage/docs/json_api/v1/buckets/insert#request-body
-            for all possible options. Pass nested parameters as dictionaries, e.g.:
-            `{"autoclass": {"enabled": True}}`
         """
         bucket, object, generation = self.split_path(path)
         if bucket in ["", "/"]:
@@ -1054,23 +1459,97 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         self.invalidate_cache(bucket)
         self.invalidate_cache("")
 
+    async def _mkdir(
+        self,
+        path,
+        create_parents=False,
+        enable_hierarchical_namespace=False,
+        placement=None,
+        location=None,
+        **kwargs,
+    ):
+        """
+        Create a directory or bucket.
+
+        If the path refers to a bucket (no object key), a new bucket is created.
+        If the path refers to a directory (includes object key), a directory is created.
+        """
+        path = self._strip_protocol(path)
+        bucket, key, _ = self.split_path(path)
+
+        should_create_zonal_bucket = placement is not None
+        should_create_hns_bucket = (
+            enable_hierarchical_namespace or should_create_zonal_bucket
+        )
+
+        bucket_kwargs = kwargs.copy()
+        if location:
+            bucket_kwargs["location"] = location
+        if should_create_zonal_bucket:
+            bucket_kwargs["customPlacementConfig"] = {"dataLocations": [placement]}
+            bucket_kwargs["storageClass"] = "RAPID"
+
+        if should_create_hns_bucket:
+            bucket_kwargs["hierarchicalNamespace"] = {"enabled": True}
+            bucket_kwargs["iamConfiguration"] = {
+                "uniformBucketLevelAccess": {"enabled": True}
+            }
+            bucket_kwargs["acl"] = None
+            bucket_kwargs["default_acl"] = None
+
+        if not key:
+            return await self._mkdir_flat(
+                path, create_parents=create_parents, **bucket_kwargs
+            )
+
+        if create_parents and should_create_hns_bucket:
+            if not await self._exists(bucket):
+                await self._mkdir_flat(bucket, create_parents=True, **bucket_kwargs)
+
+        driver = await self._get_driver(bucket)
+        return await driver.mkdir(path, create_parents=create_parents, **bucket_kwargs)
+
     mkdir = asyn.sync_wrapper(_mkdir)
 
-    async def _rmdir(self, bucket):
-        """Delete an empty bucket
+    async def _makedirs(self, path, exist_ok=False):
+        """Recursively make directories."""
+        path = self._strip_protocol(path)
+        bucket, key, _ = self.split_path(path)
 
-        Parameters
-        ----------
-        bucket: str
-            bucket name. If contains '/' (i.e., looks like subdir), will
-            have no effect because GCS doesn't have real directories.
-        """
+        if bucket in ["", "/"]:
+            raise ValueError("Cannot create root bucket")
+
+        if not await self._exists(bucket):
+            raise FileNotFoundError(f"Bucket does not exist: {bucket}")
+
+        if not key:
+            if not exist_ok:
+                raise FileExistsError(f"Bucket already exists: {bucket}")
+            return
+
+        driver = await self._get_driver(bucket)
+        if not driver.is_hns:
+            return
+
+        await driver.mkdir(path, create_parents=True, exist_ok=exist_ok)
+
+    makedirs = asyn.sync_wrapper(_makedirs)
+
+    async def _rmdir_flat(self, bucket):
+        """Delete an empty bucket"""
         bucket = bucket.rstrip("/")
         if "/" in bucket:
             return
         await self._call("DELETE", "b/" + bucket, json_out=False)
         self.invalidate_cache(bucket)
         self.invalidate_cache("")
+
+    async def _rmdir(self, path):
+        """Delete an empty bucket or folder."""
+        path = self._strip_protocol(path)
+        bucket, _, _ = self.split_path(path)
+        driver = await self._get_driver(bucket)
+        return await driver.rmdir(path)
 
     rmdir = asyn.sync_wrapper(_rmdir)
 
@@ -1139,7 +1618,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 pass
             return await get_directory_info_task
 
-    async def _get_directory_info(self, path, bucket, key, generation):
+    async def _get_directory_info_flat(self, path, bucket, key, generation):
         """
         Internal method to check if a path is a directory by listing objects.
         """
@@ -1159,6 +1638,10 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             }
         else:
             raise FileNotFoundError(path)
+
+    async def _get_directory_info(self, path, bucket, key, generation):
+        driver = await self._get_driver(bucket)
+        return await driver.get_directory_info(path, bucket, key, generation)
 
     async def _ls(
         self, path, detail=False, prefix="", versions=False, refresh=False, **kwargs
@@ -1274,17 +1757,10 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             raise
 
     async def _cat_file(self, path, start=None, end=None, **kwargs):
-        """Simple one-shot, or concurrent get of file data"""
-        concurrency = kwargs.pop("concurrency", 1)
-        if concurrency > 1:
-            return await self._cat_file_concurrent(
-                path, start=start, end=end, concurrency=concurrency, **kwargs
-            )
-
-        # While we could just call _cat_file_concurrent(concurrency=1), we are choosing
-        # to keep it separate because concurrency code path is still in an experimental phase.
-        # Once concurrency code path is stabilized, we can remove this if-else condition.
-        return await self._cat_file_sequential(path, start=start, end=end, **kwargs)
+        """Fetch a file's contents as bytes."""
+        bucket, _, _ = self.split_path(path)
+        driver = await self._get_driver(bucket)
+        return await driver.cat_file(path, start=start, end=end, **kwargs)
 
     async def _getxattr(self, path, attr):
         """Get user-defined metadata attribute"""
@@ -1356,7 +1832,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
 
     setxattrs = asyn.sync_wrapper(_setxattrs)
 
-    async def _merge(self, path, paths, acl=None):
+    async def _merge_flat(self, path, paths, acl=None):
         """Concatenate objects within a single bucket"""
         bucket, key, generation = self.split_path(path)
         source = [{"name": self.split_path(p)[1]} for p in paths]
@@ -1374,10 +1850,14 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             },
         )
 
+    async def _merge(self, path, paths, acl=None):
+        bucket, _, _ = self.split_path(path)
+        driver = await self._get_driver(bucket)
+        return await driver.merge(path, paths, acl=acl)
+
     merge = asyn.sync_wrapper(_merge)
 
-    # TODO: Add async mv method in the async.py and remove from GCSFileSystem.
-    async def _mv(
+    async def _mv_flat(
         self, path1, path2, recursive=False, maxdepth=None, batch_size=None, **kwargs
     ):
         if path1 == path2:
@@ -1439,9 +1919,77 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                         continue
                 raise res
 
+    async def _mv(self, path1, path2, **kwargs):
+        """Move a file or directory with HNS-optimized folder rename when available."""
+        if path1 == path2:
+            logger.debug(
+                "%s mv: The paths are the same, so no files/directories were moved.",
+                self,
+            )
+            return
+
+        if (
+            isinstance(path1, list)
+            or isinstance(path2, list)
+            or (isinstance(path1, str) and has_magic(path1))
+        ):
+            return await self._mv_flat(path1, path2, **kwargs)
+
+        bucket1, key1, _ = self.split_path(path1)
+        bucket2, key2, _ = self.split_path(path2)
+
+        driver1 = await self._get_driver(bucket1)
+        if not driver1.is_hns:
+            return await self._mv_flat(path1, path2, **kwargs)
+
+        try:
+            info1 = await self._info(path1)
+            is_folder = info1.get("type") == "directory"
+
+            if is_folder and bucket1 == bucket2 and key1:
+                logger.debug(
+                    f"Using HNS-aware folder rename for '{path1}' to '{path2}'."
+                )
+                source_folder_name = f"projects/_/buckets/{bucket1}/folders/{key1}"
+                destination_folder_id = key2 or key1.rstrip("/").split("/")[-1]
+
+                request = storage_control_v2.RenameFolderRequest(
+                    name=source_folder_name,
+                    destination_folder_id=destination_folder_id,
+                    request_id=str(uuid.uuid4()),
+                )
+                client = await self._get_control_plane_client()
+                operation = await client.rename_folder(
+                    request=request,
+                    retry=self._get_retry_config(),
+                    timeout=STORAGE_CONTROL_RPC_TIMEOUT,
+                )
+                await operation.result()
+                self._update_dircache_after_rename(path1, path2)
+                return
+            elif not is_folder:
+                await self._mv_file(path1, path2)
+                return
+        except Exception as e:
+            if isinstance(e, FileNotFoundError):
+                raise
+            if isinstance(e, api_exceptions.NotFound):
+                raise FileNotFoundError(
+                    f"Source '{path1}' not found for move operation."
+                ) from e
+            if isinstance(e, api_exceptions.Conflict):
+                raise FileExistsError(
+                    f"HNS rename failed due to conflict for '{path1}' to '{path2}'"
+                ) from e
+            if isinstance(e, api_exceptions.FailedPrecondition):
+                raise OSError(f"HNS rename failed: {e}") from e
+            logger.warning(f"Could not perform HNS-aware mv: {e}")
+
+        return await self._mv_flat(path1, path2, **kwargs)
+
     mv = asyn.sync_wrapper(_mv)
 
-    async def _cp_file(self, path1, path2, acl=None, **kwargs):
+    async def _cp_file_flat(self, path1, path2, acl=None, **kwargs):
         """Duplicate remote file"""
         b1, k1, g1 = self.split_path(path1)
         b2, k2, g2 = self.split_path(path2)
@@ -1474,6 +2022,18 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 sourceGeneration=g1,
             )
         await self._write_file_cache_update(path2)
+
+    async def _cp_file(self, path1, path2, acl=None, **kwargs):
+        b1, _, _ = self.split_path(path1)
+        b2, _, _ = self.split_path(path2)
+        driver1 = await self._get_driver(b1)
+        driver2 = await self._get_driver(b2)
+        if driver1.is_zonal or driver2.is_zonal:
+            raise NotImplementedError(
+                "Server-side copy involving Zonal buckets is not supported. "
+                "Zonal objects do not support rewrite."
+            )
+        return await driver1.cp_file(path1, path2, acl=acl, **kwargs)
 
     async def _mv_file(self, path1, path2, **kwargs):
         src_bucket, src_key, generation1 = self.split_path(path1)
@@ -1633,7 +2193,145 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 [self._rm_file(f) for f in files], return_exceptions=True, batch_size=5
             )
 
-    async def _rm(self, path, recursive=False, maxdepth=None, batchsize=100):
+    async def _expand_path_with_details(
+        self, path, recursive=False, maxdepth=None, detail=False, assume_literal=False
+    ):
+        """
+        Expand path with details, similar to `_expand_path` but returning full details.
+        """
+        if maxdepth is not None and maxdepth < 1:
+            raise ValueError("maxdepth must be at least 1")
+
+        if isinstance(path, str):
+            return await self._expand_path_with_details(
+                [path],
+                recursive,
+                maxdepth,
+                detail=detail,
+                assume_literal=assume_literal,
+            )
+        else:
+            out = {} if detail else set()
+            path = [self._strip_protocol(p) for p in path]
+
+            for p in path:
+                if not assume_literal and has_magic(p):
+                    bit = await self._glob(p, maxdepth=maxdepth, detail=detail)
+                    if detail:
+                        out.update(bit)
+                        bit_paths = list(bit.keys())
+                    else:
+                        bit_set = set(bit)
+                        out |= bit_set
+                        bit_paths = list(bit_set)
+
+                    if recursive:
+                        if maxdepth is not None and maxdepth <= 1:
+                            continue
+                        rec = await self._expand_path_with_details(
+                            bit_paths,
+                            recursive=recursive,
+                            maxdepth=maxdepth - 1 if maxdepth is not None else None,
+                            detail=detail,
+                            assume_literal=True,
+                        )
+                        if detail:
+                            for info in rec:
+                                out[info["name"]] = info
+                        else:
+                            out |= set(rec)
+                    continue
+                elif recursive:
+                    rec = await self._find(
+                        p, maxdepth=maxdepth, withdirs=True, detail=detail
+                    )
+                    if detail:
+                        out.update(rec)
+                    else:
+                        out |= set(rec)
+
+                if p not in out:
+                    if detail:
+                        try:
+                            info = await self._info(p)
+                            out[p] = info
+                        except (FileNotFoundError, OSError):
+                            pass
+                    elif recursive is False or (await self._exists(p)):
+                        out.add(p)
+
+            if detail:
+                out = list(out.values())
+            else:
+                out = sorted(out)
+
+        if not out:
+            raise FileNotFoundError(path)
+        return out
+
+    async def _rm_bucket_paths(
+        self, bucket, path, recursive=False, maxdepth=None, batchsize=20
+    ):
+        """Helper method to handle the rm operation for paths within a single bucket."""
+        driver = await self._get_driver(bucket)
+        if not driver.is_hns:
+            return await self._rm_flat(
+                path, recursive=recursive, maxdepth=maxdepth, batchsize=batchsize
+            )
+
+        paths = await self._expand_path_with_details(
+            path, recursive=recursive, maxdepth=maxdepth, detail=True
+        )
+
+        files = list({p["name"] for p in paths if p["type"] == "file"})
+        dirs = sorted(
+            {p["name"] for p in paths if p["type"] == "directory"},
+            reverse=True,
+        )
+
+        return await self._perform_rm(files, dirs, path, batchsize=batchsize)
+
+    async def _perform_rm(self, files, dirs, path, batchsize):
+        if not files and not dirs:
+            raise FileNotFoundError(path)
+
+        exs = await self._delete_files(files, batchsize)
+        dirs_by_depth = {}
+        for d in dirs:
+            depth = d.count("/")
+            dirs_by_depth.setdefault(depth, []).append(d)
+
+        for depth in sorted(dirs_by_depth.keys(), reverse=True):
+            level_dirs = dirs_by_depth[depth]
+            results = await asyn._run_coros_in_chunks(
+                [self._rmdir(d) for d in level_dirs],
+                batch_size=batchsize,
+                return_exceptions=True,
+            )
+            for res in results:
+                if isinstance(res, Exception):
+                    exs.append(res)
+
+        errors = [
+            ex
+            for ex in exs
+            if isinstance(ex, Exception)
+            and not isinstance(ex, (FileNotFoundError, api_exceptions.NotFound))
+            and "No such object" not in str(ex)
+        ]
+
+        if errors:
+            raise errors[0]
+
+        return [
+            e
+            for e in exs
+            if isinstance(e, Exception)
+            and not isinstance(e, (FileNotFoundError, api_exceptions.NotFound))
+            and "No such object" not in str(e)
+        ]
+
+    async def _rm_flat(self, path, recursive=False, maxdepth=None, batchsize=100):
         # 100 is the maximum number of operations allowed in a single GCS batch
         # request (https://cloud.google.com/storage/docs/batch); using the full
         # limit minimizes the number of round-trips when deleting many objects.
@@ -1667,9 +2365,52 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             raise FileNotFoundError(path)
         return exs
 
+    async def _rm(self, path, recursive=False, maxdepth=None, batchsize=20):
+        """Deletes files and directories."""
+        if isinstance(path, str):
+            path = [path]
+
+        if not path:
+            return []
+
+        grouped = {}
+        for p in path:
+            bucket, _, _ = self.split_path(p)
+            grouped.setdefault(bucket, []).append(p)
+
+        bucket_results = await asyn._run_coros_in_chunks(
+            [
+                self._rm_bucket_paths(
+                    bucket,
+                    bucket_paths,
+                    recursive=recursive,
+                    maxdepth=maxdepth,
+                    batchsize=batchsize,
+                )
+                for bucket, bucket_paths in grouped.items()
+            ],
+            return_exceptions=True,
+        )
+
+        results = []
+        succeeded = False
+        for res in bucket_results:
+            if isinstance(res, FileNotFoundError):
+                continue
+            if isinstance(res, Exception):
+                raise res
+            succeeded = True
+            if res:
+                results.extend(res)
+
+        if not succeeded:
+            raise FileNotFoundError(path)
+
+        return results
+
     rm = asyn.sync_wrapper(_rm)
 
-    async def _pipe_file(
+    async def _pipe_file_flat(
         self,
         path,
         data,
@@ -1728,7 +2469,33 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         await self._write_file_cache_update(path)
         return location
 
-    async def _put_file(
+    async def _pipe_file(
+        self,
+        path,
+        data,
+        metadata=None,
+        consistency=None,
+        content_type="application/octet-stream",
+        fixed_key_metadata=None,
+        chunksize=50 * 2**20,
+        mode="overwrite",
+        **kwargs,
+    ):
+        bucket, _, _ = self.split_path(path)
+        driver = await self._get_driver(bucket)
+        return await driver.pipe_file(
+            path,
+            data,
+            metadata=metadata,
+            consistency=consistency,
+            content_type=content_type,
+            fixed_key_metadata=fixed_key_metadata,
+            chunksize=chunksize,
+            mode=mode,
+            **kwargs,
+        )
+
+    async def _put_file_flat(
         self,
         lpath,
         rpath,
@@ -1806,6 +2573,34 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
 
             await self._write_file_cache_update(rpath)
 
+    async def _put_file(
+        self,
+        lpath,
+        rpath,
+        metadata=None,
+        consistency=None,
+        content_type=None,
+        chunksize=50 * 2**20,
+        callback=None,
+        fixed_key_metadata=None,
+        mode="overwrite",
+        **kwargs,
+    ):
+        bucket, _, _ = self.split_path(rpath)
+        driver = await self._get_driver(bucket)
+        return await driver.put_file(
+            lpath,
+            rpath,
+            metadata=metadata,
+            consistency=consistency,
+            content_type=content_type,
+            chunksize=chunksize,
+            callback=callback,
+            fixed_key_metadata=fixed_key_metadata,
+            mode=mode,
+            **kwargs,
+        )
+
     async def _isdir(self, path):
 
         try:
@@ -1813,7 +2608,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         except OSError:
             return False
 
-    async def _find(
+    async def _find_flat(
         self,
         path,
         withdirs=False,
@@ -1875,6 +2670,142 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if versions:
             return [f"{o['name']}#{o['generation']}" for o in objects]
         return [o["name"] for o in objects]
+
+    async def _find(
+        self,
+        path,
+        withdirs=False,
+        detail=False,
+        prefix="",
+        versions=False,
+        maxdepth=None,
+        **kwargs,
+    ):
+        """HNS-aware find. Lists empty folders in HNS buckets."""
+        path = self._strip_protocol(path)
+        if maxdepth is not None and maxdepth < 1:
+            raise ValueError("maxdepth must be at least 1")
+        bucket, _, _ = self.split_path(path)
+
+        driver = await self._get_driver(bucket)
+        if not driver.is_hns:
+            return await self._find_flat(
+                path,
+                withdirs=withdirs,
+                detail=detail,
+                prefix=prefix,
+                versions=versions,
+                maxdepth=maxdepth,
+                **kwargs,
+            )
+
+        files_task = asyncio.create_task(
+            self._find_flat(
+                path,
+                withdirs=False,
+                detail=True,
+                prefix=prefix,
+                versions=versions,
+                maxdepth=None,
+                update_cache=False,
+                **kwargs,
+            )
+        )
+        folders_task = asyncio.create_task(
+            self._get_all_folders(path, bucket, prefix=prefix)
+        )
+        files_result, folders_result = await asyncio.gather(files_task, folders_task)
+
+        cacheable_objects = list(files_result.values()) + folders_result
+        self._get_dirs_and_update_cache(path, cacheable_objects, prefix=prefix)
+
+        if not withdirs:
+            all_objects = list(files_result.values())
+        else:
+            all_objects = cacheable_objects
+
+        all_objects.sort(key=lambda o: o["name"])
+
+        if maxdepth:
+            depth = path.rstrip("/").count("/") + maxdepth
+            all_objects = [o for o in all_objects if o["name"].count("/") <= depth]
+
+        if detail:
+            if versions:
+                return {
+                    (
+                        f"{o['name']}#{o['generation']}"
+                        if "generation" in o
+                        else o["name"]
+                    ): o
+                    for o in all_objects
+                }
+            return {o["name"]: o for o in all_objects}
+
+        if versions:
+            return [
+                f"{o['name']}#{o['generation']}" if "generation" in o else o["name"]
+                for o in all_objects
+            ]
+        return [o["name"] for o in all_objects]
+
+    async def _get_all_folders(self, path, bucket, prefix=""):
+        """
+        Recursively fetches all folder objects under a given path using the
+        Storage Control API.
+        """
+        _, base_path, _ = self.split_path(path)
+        base_path = "" if not base_path else base_path.rstrip("/") + "/"
+        full_prefix = f"{base_path}{prefix}"
+
+        if full_prefix and not full_prefix.endswith("/"):
+            partition = full_prefix.rpartition("/")
+            start_dir = partition[0] + partition[1]
+        else:
+            start_dir = full_prefix
+
+        folders = []
+        client = await self._get_control_plane_client()
+        parent = f"projects/_/buckets/{bucket}"
+
+        request = storage_control_v2.ListFoldersRequest(
+            parent=parent, prefix=start_dir, request_id=str(uuid.uuid4())
+        )
+
+        try:
+            async for folder in await client.list_folders(
+                request=request,
+                retry=self._get_retry_config(),
+                timeout=STORAGE_CONTROL_RPC_TIMEOUT,
+            ):
+                entry = self._create_folder_entry(bucket, folder)
+                _, key, _ = self.split_path(entry["name"])
+                key_with_slash = key + "/"
+
+                if key.startswith(full_prefix) or key_with_slash.startswith(
+                    full_prefix
+                ):
+                    folders.append(entry)
+        except api_exceptions.NotFound:
+            pass
+
+        return folders
+
+    def _create_folder_entry(self, bucket, folder):
+        """Helper to create a dictionary representing a folder entry."""
+        path = f"{bucket}/{folder.name.split('/folders/')[1]}".rstrip("/")
+        _, key, _ = self.split_path(path)
+        return {
+            "Key": key,
+            "Size": 0,
+            "name": path,
+            "size": 0,
+            "type": "directory",
+            "storageClass": "DIRECTORY",
+            "ctime": folder.create_time,
+            "mtime": folder.update_time,
+            "metageneration": folder.metageneration,
+        }
 
     def _get_dirs_and_update_cache(self, path, objects, prefix="", update_cache=True):
         """
@@ -1962,7 +2893,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         return dirs
 
     @retry_request(retries=retries)
-    async def _get_file_request(
+    async def _get_file_request_flat(
         self, rpath, lpath, *args, headers=None, callback=None, **kwargs
     ):
         rpath = self.url(rpath)
@@ -1997,6 +2928,15 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             checker.validate_http_response(r)  # validate file consistency
             return r.status, r.headers, r.request_info, data
 
+    async def _get_file_request(
+        self, rpath, lpath, *args, headers=None, callback=None, **kwargs
+    ):
+        bucket, _, _ = self.split_path(rpath)
+        driver = await self._get_driver(bucket)
+        return await driver.get_file_request(
+            rpath, lpath, *args, headers=headers, callback=callback, **kwargs
+        )
+
     def _init_local_file(self, lpath, total_size):
         """Creates the target directory and pre-allocates the file size."""
         os.makedirs(os.path.dirname(lpath) or os.curdir, exist_ok=True)
@@ -2008,7 +2948,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 f.truncate(total_size)
 
     @retry_request(retries=retries)
-    async def _get_file_concurrent(
+    async def _get_file_concurrent_flat(
         self,
         rpath,
         lpath,
@@ -2178,6 +3118,32 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if check_consistency:
             checker.validate_json_response(details)
 
+    async def _get_file_concurrent(
+        self,
+        rpath,
+        lpath,
+        concurrency,
+        chunk_size,
+        max_prefetch_size,
+        headers=None,
+        callback=None,
+        fetcher_fn=None,
+        **kwargs,
+    ):
+        bucket, _, _ = self.split_path(rpath)
+        driver = await self._get_driver(bucket)
+        return await driver.get_file_concurrent(
+            rpath,
+            lpath,
+            concurrency,
+            chunk_size,
+            max_prefetch_size,
+            headers=headers,
+            callback=callback,
+            fetcher_fn=fetcher_fn,
+            **kwargs,
+        )
+
     async def _get_file(self, rpath, lpath, callback=None, **kwargs):
         if os.path.isdir(lpath):
             return
@@ -2224,26 +3190,26 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         **kwargs,
     ):
         """
-        See ``GCSFile``.
-
-        consistency: None or str
-            If None, use default for this instance
+        Open a file.
         """
-        if block_size is None:
-            block_size = self.default_block_size
-        const = consistency or self.consistency
-        return GCSFile(
-            self,
+        bucket, _, _ = self.split_path(path)
+        try:
+            bucket_type = self._sync_lookup_bucket_type(bucket)
+        except Exception:
+            bucket_type = BucketType.UNKNOWN
+        driver = self._get_driver_by_type(bucket_type)
+        return driver.open(
             path,
-            mode,
-            block_size,
+            mode=mode,
+            block_size=block_size or self.default_block_size,
             cache_options=cache_options,
-            consistency=const,
+            consistency=consistency or self.consistency,
             metadata=metadata,
             acl=acl,
             autocommit=autocommit,
             fixed_key_metadata=fixed_key_metadata,
             generation=generation,
+            finalize_on_close=kwargs.pop("finalize_on_close", self.finalize_on_close),
             **kwargs,
         )
 
@@ -2804,29 +3770,17 @@ def _convert_fixed_key_metadata(metadata, *, from_google=False):
 
 async def upload_chunk(fs, location, data, offset, size, content_type):
     """
-    Uploads a chunk of data. This function has a conditional path to support
-    experimental features for Zonal buckets to append data using gRPC.
+    Uploads a chunk of data.
     """
-    from google.cloud.storage.asyncio.async_appendable_object_writer import (
-        AsyncAppendableObjectWriter,
-    )
+    if not isinstance(location, (str, bytes)):
+        driver = fs._get_driver_by_type(BucketType.ZONAL_HIERARCHICAL)
+        return await driver.upload_chunk(location, data, offset, size, content_type)
 
-    from .extended_gcsfs import ExtendedGcsFileSystem
-    from .extended_gcsfs import upload_chunk as ext_upload_chunk
-
-    # location is AsyncAppendableObjectWriter only when ExtendedGcsFileSystem is used
-    if isinstance(fs, ExtendedGcsFileSystem) and isinstance(
-        location, AsyncAppendableObjectWriter
-    ):
-
-        return await ext_upload_chunk(fs, location, data, offset, size, content_type)
     head = {}
     l = len(data)
     range = "bytes %i-%i/%i" % (offset, offset + l - 1, size)
     head["Content-Range"] = range
     head.update({"Content-Type": content_type, "Content-Length": str(l)})
-    # aiohttp handles bytes and memoryview natively and zero-copy;
-    # no need to wrap in UnclosableBytesIO.
     payload = (
         data
         if isinstance(data, (bytes, bytearray, memoryview))
@@ -2854,26 +3808,18 @@ async def initiate_upload(
     kms_key_name=None,
 ):
     """
-    Initiates a resumable upload. This function has a conditional path to support
-    experimental features for Zonal buckets to append data using gRPC, returning an
-    "AsyncAppendableObjectWriter" instance as location.
+    Initiates an upload session (resumable URL or appendable writer).
     """
-    from .extended_gcsfs import ExtendedGcsFileSystem
-    from .extended_gcsfs import initiate_upload as ext_initiate_upload
-
-    # Explicit type checking is used to ensure only the ExtendedGcsFileSystem
-    # enters this path, ruling out false positives from mocks or coincidentally matching attributes.
-    if isinstance(fs, ExtendedGcsFileSystem) and await fs._is_zonal_bucket(bucket):
-
-        return await ext_initiate_upload(
-            fs,
+    driver = await fs._get_driver(bucket)
+    if driver.is_zonal:
+        return await driver.initiate_upload(
             bucket,
             key,
-            content_type,
-            metadata,
-            fixed_key_metadata,
-            mode,
-            kms_key_name,
+            content_type=content_type,
+            metadata=metadata,
+            fixed_key_metadata=fixed_key_metadata,
+            mode=mode,
+            kms_key_name=kms_key_name,
         )
 
     j = {"name": key}
@@ -2909,29 +3855,24 @@ async def simple_upload(
     fixed_key_metadata=None,
     mode="overwrite",
     kms_key_name=None,
+    **kwargs,
 ):
     """
-    Performs a simple, single-request upload. This function has a conditional path to support
-    experimental features for Zonal buckets to upload data using gRPC.
+    Performs a simple, single-request upload.
     """
-    from .extended_gcsfs import ExtendedGcsFileSystem
-    from .extended_gcsfs import simple_upload as ext_simple_upload
-
-    # Explicit type checking is used to ensure only the ExtendedGcsFileSystem
-    # enters this path, ruling out false positives from mocks or coincidentally matching attributes.
-    if isinstance(fs, ExtendedGcsFileSystem) and await fs._is_zonal_bucket(bucket):
-
-        return await ext_simple_upload(
-            fs,
+    driver = await fs._get_driver(bucket)
+    if driver.is_zonal:
+        return await driver.simple_upload(
             bucket,
             key,
             datain,
-            metadatain,
-            consistency,
-            content_type,
-            fixed_key_metadata,
-            mode,
-            kms_key_name,
+            metadatain=metadatain,
+            consistency=consistency,
+            content_type=content_type,
+            fixed_key_metadata=fixed_key_metadata,
+            mode=mode,
+            kms_key_name=kms_key_name,
+            **kwargs,
         )
 
     checker = get_consistency_checker(consistency)
@@ -2951,8 +3892,6 @@ async def simple_upload(
     )
 
     data = template.encode() + datain + b"\n--==0==--"
-    # aiohttp handles bytes and memoryview natively and zero-copy;
-    # no need to wrap in UnclosableBytesIO.
     payload = (
         data
         if isinstance(data, (bytes, bytearray, memoryview))
