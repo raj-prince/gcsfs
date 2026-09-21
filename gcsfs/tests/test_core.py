@@ -3547,18 +3547,19 @@ def test_get_file_concurrent_early_eof(gcs):
                 new_callable=mock.AsyncMock,
                 return_value=-1,
             ),
-            mock.patch(
-                "gcsfs.prefetcher.BackgroundPrefetcher.afetch",
+            mock.patch.object(
+                gcs,
+                "_cat_file",
                 new_callable=mock.AsyncMock,
-            ) as mock_afetch,
+            ) as mock_cat,
         ):
             # Define a function to simulate consistent truncation across retries
-            async def mock_afetch_truncated(start, end):
+            async def mock_cat_truncated(path, start=0, end=None, **kwargs):
                 if start == 0:
                     return b"12345"  # Only return the first 5 bytes
                 return b""  # Return EOF for any subsequent range
 
-            mock_afetch.side_effect = mock_afetch_truncated
+            mock_cat.side_effect = mock_cat_truncated
 
             # The function will retry several times, but always fail the integrity check.
             # We assert that it eventually raises the ClientError.
@@ -3570,7 +3571,7 @@ def test_get_file_concurrent_early_eof(gcs):
 
 
 def test_get_file_concurrent_write_exception_in_loop(gcs):
-    """Coverage: `if exceptions: raise exceptions[0]` (Inside the pending loop)"""
+    """Coverage: `if exceptions: raise exceptions[0]` (Inside the worker loop)"""
     fn = f"{TEST_BUCKET}/write_exc_loop.txt"
     data = b"1234567890" * 1024 * 1024  # ~10MB (larger than 5MB default)
     gcs.pipe(fn, data)
@@ -3588,12 +3589,12 @@ def test_get_file_concurrent_write_exception_in_loop(gcs):
             mock.patch("os.pwrite", side_effect=OSError("Disk Full Loop")),
         ):
             with pytest.raises(OSError, match="Disk Full Loop"):
-                # Chunk size small to produce many pending_writes and trigger the loop check
+                # Chunk size small to produce multiple workers and trigger the check
                 gcs.get_file(fn, lpath, concurrency=2, chunk_size=5 * 1024 * 1024)
 
 
 def test_get_file_concurrent_write_exception_in_finally(gcs):
-    """Coverage: `if exc: exceptions.append(exc)` (Inside the finally clean-up block)"""
+    """Coverage: `if exc: exceptions.append(exc)` (Inside clean-up / gather)"""
     fn = f"{TEST_BUCKET}/write_exc_finally.txt"
     data = b"1234567890" * 1024 * 1024  # ~10MB (larger than 5MB default)
     gcs.pipe(fn, data)
@@ -3615,7 +3616,7 @@ def test_get_file_concurrent_write_exception_in_finally(gcs):
 
 
 def test_get_file_concurrent_cancelled_error(gcs):
-    """Coverage: `except asyncio.CancelledError: break/pass` inside the finally block"""
+    """Coverage: `except asyncio.CancelledError` cancellation handling"""
     fn = f"{TEST_BUCKET}/cancelled.txt"
     data = b"1234567890" * 1024 * 1024  # ~10MB (larger than 5MB default)
     gcs.pipe(fn, data)
@@ -3623,8 +3624,8 @@ def test_get_file_concurrent_cancelled_error(gcs):
     with tempdir() as dn:
         lpath = os.path.join(dn, "out_cancelled.txt")
 
-        # Create a mock that forces the exact exception we are trying to cover
-        async def mock_wait(*args, **kwargs):
+        # Create a mock that forces CancelledError
+        async def mock_cat(*args, **kwargs):
             raise asyncio.CancelledError()
 
         with (
@@ -3634,7 +3635,7 @@ def test_get_file_concurrent_cancelled_error(gcs):
                 new_callable=mock.AsyncMock,
                 return_value=-1,
             ),
-            mock.patch("gcsfs.core.asyncio.wait", side_effect=mock_wait),
+            mock.patch.object(gcs, "_cat_file", side_effect=mock_cat),
         ):
             gcs.get_file(fn, lpath, concurrency=2, chunk_size=20 * 1024 * 1024)
 

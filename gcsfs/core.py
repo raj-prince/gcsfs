@@ -2018,32 +2018,16 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         lpath,
         concurrency,
         chunk_size,
-        max_prefetch_size,
+        max_prefetch_size=None,
         headers=None,
         callback=None,
         fetcher_fn=None,
         **kwargs,
     ):
-        """Main orchestrator for concurrent file downloads utilizing BackgroundPrefetcher."""
+        """Main orchestrator for concurrent file downloads directly invoking parallelism."""
         details = await self._info(rpath, **kwargs)
         total_size = details.get("size", 0)
 
-        # Concurrency typically improves performance for RAM downloads exceeding 5MB.
-        # However, for disk-backed reads in the standard bucket, _cat_file uses
-        # b"".join, which creates an additional data copy of chunks. Additionally,
-        # prefetching is ineffective for reads under 100MB because it only activates
-        # from the third read onward and scales linearly. These factors often make
-        # concurrent processing slower than writing data as it arrives.
-        #
-        #
-        # Note that the number is 5MB for zonal buckets, Thanks to our in-house, zero-copy
-        # DirectMemmoveBuffer, we didn't integrated it initially with standard bucket, because
-        # we first want to stabilise that in zonal bucket (lower traffic compared to standard)
-        #
-        # Promoting DirectMemmoveBuffer (currently used in the Zonal bucket)
-        # to the standard bucket will enable in-place assembly and lower this
-        # threshold. Until then, the concurrent path for standard is enabled only for disk
-        # reads of 100MB or more.
         bucket, _, _ = self.split_path(rpath)
         threshold = await self._get_threshold_for_disk_reads(bucket)
         if total_size <= max(self.MIN_CHUNK_SIZE_FOR_CONCURRENCY, threshold):
@@ -2065,7 +2049,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         callback = callback or NoOpCallback()
         callback.set_size(total_size)
 
-        # pre-allocate the file, it is required so multiple file descriptors can seek/write safely.
+        # Pre-allocate the local file so multiple threads can seek/write safely
         self._init_local_file(lpath, total_size)
         checker = get_consistency_checker(consistency)
 
@@ -2083,16 +2067,6 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
 
             fetcher_fn = default_fetcher
 
-        from .prefetcher import BackgroundPrefetcher
-
-        prefetcher = BackgroundPrefetcher(
-            fetcher=fetcher_fn,
-            size=total_size,
-            concurrency=concurrency,
-            max_prefetch_size=max_prefetch_size,
-            loop=self.loop,
-        )
-
         fd = None
 
         def write_chunk(offset, chunk):
@@ -2107,77 +2081,81 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                     f.seek(offset)
                     f.write(chunk)
 
-        pending_writes = set()
+        offset = 0
+        offset_lock = asyncio.Lock()
+        stop_event = asyncio.Event()
+
+        async def get_next_chunk():
+            nonlocal offset
+            async with offset_lock:
+                if offset >= total_size or stop_event.is_set():
+                    return None, None
+                cur_offset = offset
+                cur_size = min(chunk_size, total_size - cur_offset)
+                offset += cur_size
+                return cur_offset, cur_size
+
+        total_bytes_received = 0
+        completed_chunks = {}
+        next_hash_offset = 0
+
+        async def worker():
+            nonlocal total_bytes_received, next_hash_offset
+            while not stop_event.is_set():
+                chunk_offset, size = await get_next_chunk()
+                if chunk_offset is None:
+                    break
+
+                data = await fetcher_fn(chunk_offset, size)
+                if not data:
+                    stop_event.set()
+                    break
+
+                await asyncio.to_thread(write_chunk, chunk_offset, data)
+
+                callback.relative_update(len(data))
+                total_bytes_received += len(data)
+
+                if check_consistency:
+                    completed_chunks[chunk_offset] = data
+                    while next_hash_offset in completed_chunks:
+                        chunk_to_hash = completed_chunks.pop(next_hash_offset)
+                        checker.update(chunk_to_hash)
+                        next_hash_offset += len(chunk_to_hash)
+                        del chunk_to_hash
+
+                if len(data) < size:
+                    # Premature EOF from fetcher
+                    stop_event.set()
+                    break
+
+        num_chunks = (
+            (total_size + chunk_size - 1) // chunk_size if chunk_size > 0 else 1
+        )
+        worker_count = min(concurrency, num_chunks) if num_chunks > 0 else 1
+        worker_tasks = []
         try:
             if hasattr(os, "pwrite"):
                 fd = os.open(lpath, os.O_WRONLY | getattr(os, "O_BINARY", 0))
 
-            async with prefetcher:
-                offset = 0
-                while offset < total_size:
-                    read_size = min(chunk_size, total_size - offset)
+            worker_tasks = [asyncio.create_task(worker()) for _ in range(worker_count)]
+            await asyncio.gather(*worker_tasks)
 
-                    data = await prefetcher.afetch(offset, offset + read_size)
-
-                    if not data:
-                        break
-
-                    if check_consistency:
-                        checker.update(data)
-
-                    callback.relative_update(len(data))
-
-                    task = asyncio.create_task(
-                        asyncio.to_thread(write_chunk, offset, data)
-                    )
-                    pending_writes.add(task)
-
-                    if len(pending_writes) >= concurrency:
-                        done, pending_writes = await asyncio.wait(
-                            pending_writes, return_when=asyncio.FIRST_COMPLETED
-                        )
-
-                        exceptions = []
-                        for t in done:
-                            exc = t.exception()
-                            if exc:
-                                exceptions.append(exc)
-
-                        if exceptions:
-                            raise exceptions[0]
-
-                    offset += len(data)
-
-                if offset != total_size:
-                    raise aiohttp.client_exceptions.ClientError(
-                        f"Expected {total_size} bytes, but only received {offset} bytes"
-                    )
+            if total_bytes_received != total_size:
+                raise aiohttp.client_exceptions.ClientError(
+                    f"Expected {total_size} bytes, but only received {total_bytes_received} bytes"
+                )
+        except BaseException:
+            stop_event.set()
+            for t in worker_tasks:
+                if not t.done():
+                    t.cancel()
+            if worker_tasks:
+                await asyncio.gather(*worker_tasks, return_exceptions=True)
+            raise
         finally:
-            all_done = set()
-            was_cancelled = False
-            if pending_writes:
-                while pending_writes:
-                    try:
-                        done_wait, pending_writes = await asyncio.wait(pending_writes)
-                        all_done.update(done_wait)
-                    except asyncio.CancelledError:
-                        was_cancelled = True
-                        pass
-
             if fd is not None:
                 os.close(fd)
-
-            exceptions = []
-            for t in all_done:
-                exc = t.exception()
-                if exc:
-                    exceptions.append(exc)
-
-            if was_cancelled:
-                raise asyncio.CancelledError()
-
-            if exceptions and sys.exc_info()[1] is None:
-                raise exceptions[0]
 
         if check_consistency:
             checker.validate_json_response(details)
