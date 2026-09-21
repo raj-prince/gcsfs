@@ -394,8 +394,9 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
     # This threshold applies to the standard bucket, whereas the zonal bucket
     # uses a 5MB threshold. This difference exists because the standard bucket
     # lacks the `DirectMemmoveBuffer` implementation used in the zonal bucket.
+    # Concurrency threshold for disk reads (default 5MB across all buckets)
     async def _get_threshold_for_disk_reads(self, bucket):
-        return 100 * 1024 * 1024
+        return self.MIN_CHUNK_SIZE_FOR_CONCURRENCY
 
     # Clean up the aiohttp session
     #
@@ -2081,6 +2082,18 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                     f.seek(offset)
                     f.write(chunk)
 
+        # Determine effective chunk size:
+        # If total_size can be split into chunks across all workers without dropping below
+        # MIN_CHUNK_SIZE_FOR_CONCURRENCY, size chunks adaptively so that all workers can contribute.
+        num_workers = max(1, concurrency)
+        if total_size > num_workers * self.MIN_CHUNK_SIZE_FOR_CONCURRENCY:
+            actual_chunk_size = max(
+                self.MIN_CHUNK_SIZE_FOR_CONCURRENCY,
+                min(chunk_size, total_size // num_workers),
+            )
+        else:
+            actual_chunk_size = self.MIN_CHUNK_SIZE_FOR_CONCURRENCY
+
         offset = 0
         offset_lock = asyncio.Lock()
         stop_event = asyncio.Event()
@@ -2091,13 +2104,14 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 if offset >= total_size or stop_event.is_set():
                     return None, None
                 cur_offset = offset
-                cur_size = min(chunk_size, total_size - cur_offset)
+                cur_size = min(actual_chunk_size, total_size - cur_offset)
                 offset += cur_size
                 return cur_offset, cur_size
 
         total_bytes_received = 0
         completed_chunks = {}
         next_hash_offset = 0
+        pending_writes = set()
 
         async def worker():
             nonlocal total_bytes_received, next_hash_offset
@@ -2111,7 +2125,10 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                     stop_event.set()
                     break
 
-                await asyncio.to_thread(write_chunk, chunk_offset, data)
+                write_task = asyncio.create_task(
+                    asyncio.to_thread(write_chunk, chunk_offset, data)
+                )
+                pending_writes.add(write_task)
 
                 callback.relative_update(len(data))
                 total_bytes_received += len(data)
@@ -2129,8 +2146,21 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                     stop_event.set()
                     break
 
+                if len(pending_writes) >= concurrency:
+                    done_writes, pending_writes_subset = await asyncio.wait(
+                        pending_writes, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for tw in done_writes:
+                        exc = tw.exception()
+                        if exc:
+                            stop_event.set()
+                            raise exc
+                    pending_writes.difference_update(done_writes)
+
         num_chunks = (
-            (total_size + chunk_size - 1) // chunk_size if chunk_size > 0 else 1
+            (total_size + actual_chunk_size - 1) // actual_chunk_size
+            if actual_chunk_size > 0
+            else 1
         )
         worker_count = min(concurrency, num_chunks) if num_chunks > 0 else 1
         worker_tasks = []
@@ -2141,6 +2171,13 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             worker_tasks = [asyncio.create_task(worker()) for _ in range(worker_count)]
             await asyncio.gather(*worker_tasks)
 
+            if pending_writes:
+                done_writes, _ = await asyncio.wait(pending_writes)
+                for tw in done_writes:
+                    exc = tw.exception()
+                    if exc:
+                        raise exc
+
             if total_bytes_received != total_size:
                 raise aiohttp.client_exceptions.ClientError(
                     f"Expected {total_size} bytes, but only received {total_bytes_received} bytes"
@@ -2150,8 +2187,12 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             for t in worker_tasks:
                 if not t.done():
                     t.cancel()
-            if worker_tasks:
-                await asyncio.gather(*worker_tasks, return_exceptions=True)
+            for t in pending_writes:
+                if not t.done():
+                    t.cancel()
+            all_tasks = worker_tasks + list(pending_writes)
+            if all_tasks:
+                await asyncio.gather(*all_tasks, return_exceptions=True)
             raise
         finally:
             if fd is not None:
