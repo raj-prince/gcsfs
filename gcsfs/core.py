@@ -394,9 +394,9 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
     # This threshold applies to the standard bucket, whereas the zonal bucket
     # uses a 5MB threshold. This difference exists because the standard bucket
     # lacks the `DirectMemmoveBuffer` implementation used in the zonal bucket.
-    # Concurrency threshold for disk reads (default 5MB across all buckets)
+    # Concurrency threshold for disk reads (default 32MB across all buckets)
     async def _get_threshold_for_disk_reads(self, bucket):
-        return self.MIN_CHUNK_SIZE_FOR_CONCURRENCY
+        return 32 * 1024 * 1024
 
     # Clean up the aiohttp session
     #
