@@ -38,6 +38,7 @@ from .retry import errs, retry_request, validate_response
 from .zb_hns_utils import DEFAULT_CONCURRENCY, MAX_PREFETCH_SIZE, _on_loop_thread
 
 logger = logging.getLogger("gcsfs")
+_closing_tasks = set()
 
 
 if "GCSFS_DEBUG" in os.environ:
@@ -416,7 +417,9 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if loop:
             # an explicit loop was set
             if loop.is_running():
-                loop.create_task(session.close())
+                _t = loop.create_task(session.close())
+                _closing_tasks.add(_t)
+                _t.add_done_callback(_closing_tasks.discard)
             else:
                 force_close = True
         elif current_loop is not None and current_loop.is_running() and asynchronous:
