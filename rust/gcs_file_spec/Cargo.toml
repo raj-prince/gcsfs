@@ -1,0 +1,17 @@
+[package]
+name = "gcs_file_spec"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "gcs_file_spec"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["extension-module"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+google-cloud-storage = "1"
+bytes = "1"
+base64 = "0.22"
