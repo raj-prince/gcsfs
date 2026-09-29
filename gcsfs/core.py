@@ -338,6 +338,8 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         endpoint_url=None,
         default_location=None,
         version_aware=False,
+        read_backend=None,
+        rust_transport=None,
         **kwargs,
     ):
         if cache_timeout is not None:
@@ -364,6 +366,8 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         self.session_kwargs = session_kwargs or {}
         self.default_location = default_location
         self.version_aware = version_aware
+        self.read_backend = read_backend or os.getenv("GCSFS_READ_BACKEND", "grpc")
+        self.rust_transport = rust_transport or os.getenv("GCSFS_RUST_TRANSPORT", "grpc")
 
         if check_connection:
             warnings.warn(
@@ -1101,6 +1105,26 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 else:
                     raise FileNotFoundError(path)
             return out
+        bucket, key, path_generation = self.split_path(path)
+        generation = _coalesce_generation(generation, path_generation)
+
+        if self.read_backend in ("grpc", "rust"):
+            try:
+                import gcs_file_spec
+            except ImportError:
+                gcs_file_spec = None
+
+            if gcs_file_spec is not None:
+                logger.info(
+                    "[Rust Backend] stat executing with rust backend for path='%s', generation=%s",
+                    path,
+                    generation,
+                )
+                try:
+                    return await gcs_file_spec.stat_async(path, generation=generation)
+                except FileNotFoundError:
+                    pass
+
         # Check directory cache for parent dir
         parent_path = self._parent(path)
         parent_cache = self._ls_from_cache(parent_path)
@@ -1275,6 +1299,28 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
 
     async def _cat_file(self, path, start=None, end=None, **kwargs):
         """Simple one-shot, or concurrent get of file data"""
+        if self.read_backend in ("grpc", "rust"):
+            try:
+                import gcs_file_spec
+            except ImportError:
+                gcs_file_spec = None
+
+            if gcs_file_spec is not None:
+                bucket, key, path_generation = self.split_path(path)
+                generation = _coalesce_generation(kwargs.get("generation"), path_generation)
+                if start is not None and end is not None and start >= end >= 0:
+                    return b""
+
+                logger.info(
+                    "[Rust Backend] cat_file executing with rust backend for path='%s', start=%s, end=%s",
+                    path,
+                    start,
+                    end,
+                )
+                return await gcs_file_spec.cat_file_async(
+                    path, start=start, end=end, generation=generation
+                )
+
         concurrency = kwargs.pop("concurrency", 1)
         if concurrency > 1:
             return await self._cat_file_concurrent(
