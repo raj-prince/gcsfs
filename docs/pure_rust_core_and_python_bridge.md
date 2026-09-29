@@ -233,7 +233,7 @@ async def _info(self, path, generation=None, **kwargs):
 
 ---
 
-## 5. Release & Maintenance Workflow
+## Release & Maintenance Workflow
 
 ### Releasing `gcs_file_spec` (Pure Rust)
 - Developed, benchmarked, and tested with standard `cargo test` and `cargo bench`.
@@ -249,7 +249,7 @@ async def _info(self, path, generation=None, **kwargs):
 
 ---
 
-## 6. Key Advantages of this Boundary
+## Key Advantages of this Boundary
 
 1. **Ecosystem Reusability**: The core GCS gRPC logic can be directly used in any Rust application, CLI, or microservice without pulling in Python headers or the PyO3 runtime.
 2. **Separation of Concerns**: Rust logic focuses strictly on GCS gRPC performance and streaming; the Python bridge focuses only on PyO3 conversion.
