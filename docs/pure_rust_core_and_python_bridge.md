@@ -6,7 +6,7 @@ This document details the architecture for splitting the GCS Non-POSIX implement
 
 ---
 
-## 1. Architectural Overview
+## Architectural Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -39,7 +39,7 @@ This document details the architecture for splitting the GCS Non-POSIX implement
 
 ---
 
-## 2. Component 1: Pure Rust Crate (`gcs_file_spec`)
+## Pure Rust Crate (`gcs_file_spec`)
 
 This crate lives in its own repository and can be used by any Rust project.
 
@@ -124,7 +124,7 @@ pub async fn stat(
 
 ---
 
-## 3. Component 2: Thin Python Bridge (`gcsfs/rust/`)
+## Integration with gcsfs - requires a Thin Python Bridge (`gcsfs/rust/`)
 
 Located within the `gcsfs` repository, this wrapper only handles the PyO3 boundary.
 
@@ -211,7 +211,7 @@ fn gcsfs_bindings(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 ---
 
-## 4. Component 3: Calling from Python (`gcsfs/core.py`)
+## Calling from Python (`gcsfs/core.py`)
 
 In `gcsfs`, the integration remains direct and clean:
 
