@@ -17,6 +17,19 @@ Run the bundled HuggingFace streaming demo or wrap any custom workload in Python
 
 # 2. Serve locally and open http://localhost:8765/hf_dataloader_io_trace.html in your browser
 python3 -m http.server 8765 --directory /home/princer_google_com/c1dev/gcsfs
+# 2. Run the real GCS HuggingFace subsystem benchmark with I/O tracing enabled
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 \
+GCSFS_IO_TRACE_DIR_OUT=/home/princer_google_com/c1dev/gcsfs/io_traces \
+/home/princer_google_com/c1dev/gcsfs/.venv/bin/python -m gcsfs.tests.perf.subsystembenchmarks.run \
+  --group=dataloading/huggingface_datasets \
+  --filter="read-hf-txpq-shuf-nw4-rg1800-fc256x10920-splitws8div-mbis10-reg and not pf4" \
+  --bucket-prefix=io-trace-hf \
+  --project=gcs-aiml-clients-testing-101 \
+  --location=us-central1 \
+  --amplification-wait=0
+
+# 3. Serve locally and open http://localhost:8765/ in your browser
+/home/princer_google_com/c1dev/gcsfs/.venv/bin/python -m http.server 8765 --directory /home/princer_google_com/c1dev/gcsfs/io_traces
 ```
 
 To trace your own code in Python:

@@ -87,7 +87,6 @@ def run_read_case(benchmark, monitor, params, driver, *, bucket_ctx=None):
             trace_ctx = trace_io(
                 trace_html,
                 title=f"Subsystem Benchmark I/O Trace: {run_params.name}",
-                local_block_size=0,
             )
         else:
             trace_ctx = contextlib.nullcontext()

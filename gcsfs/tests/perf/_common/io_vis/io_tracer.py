@@ -197,7 +197,6 @@ def install_hooks_in_process() -> None:
 
     atexit.register(_LOGGER.flush)
 
-    from fsspec.implementations.local import LocalFileOpener, LocalFileSystem
     from fsspec.spec import AbstractBufferedFile
 
     # 1. Hook AbstractBufferedFile.read (Logical layer)
@@ -302,7 +301,7 @@ def install_hooks_in_process() -> None:
 
     AbstractBufferedFile._fetch_range = _wrap_fetch_range(orig_abf_fetch)
 
-    # 3. Hook GCSFileSystem & GCSFile if gcsfs is importable
+    # 3. Hook GCSFileSystem & GCSFile
     with contextlib.suppress(ImportError):
         import gcsfs.core
 
@@ -347,136 +346,12 @@ def install_hooks_in_process() -> None:
 
         gcsfs.core.GCSFileSystem._cat_file_sequential = traced_cat_file_sequential
 
-    # 4. Support local file:// simulation of remote buffered reads
-    orig_local_open = LocalFileSystem._open
-    _ORIGINAL_METHODS["local_open"] = orig_local_open
-
-    class _SimulatedRemoteLocalFile(AbstractBufferedFile):
-        def _fetch_range(self, start: int, end: int) -> bytes:
-            sim_lat = float(os.environ.get("GCSFS_IO_TRACE_SIM_LATENCY_MS", "0") or 0.0)
-            if sim_lat > 0:
-                time.sleep(sim_lat / 1000.0)
-            with open(self.path, "rb") as f:
-                f.seek(start)
-                return f.read(max(0, end - start))
-
-    _SimulatedRemoteLocalFile._fetch_range = _wrap_fetch_range(
-        _SimulatedRemoteLocalFile._fetch_range
-    )
-
-    def traced_local_open(
-        self: Any,
-        path: str,
-        mode: str = "rb",
-        block_size: int | None = None,
-        **kwargs: Any,
-    ) -> Any:
-        trace_dir = os.environ.get("GCSFS_IO_TRACE_DIR")
-        sim_block = int(os.environ.get("GCSFS_IO_TRACE_LOCAL_BLOCK_SIZE", "0") or 0)
-        stripped = self._strip_protocol(path)
-        if (
-            trace_dir
-            and sim_block > 0
-            and "r" in mode
-            and not stripped.startswith(trace_dir)
-            and any(
-                stripped.endswith(ext)
-                for ext in (
-                    ".parquet",
-                    ".jsonl",
-                    ".arrow",
-                    ".bin",
-                    ".safetensors",
-                    ".pt",
-                    ".tar",
-                    ".csv",
-                )
-            )
-        ):
-            fsize = self.info(stripped)["size"]
-            cache_type = os.environ.get("GCSFS_IO_TRACE_LOCAL_CACHE_TYPE", "readahead")
-            return _SimulatedRemoteLocalFile(
-                self,
-                stripped,
-                mode=mode,
-                block_size=sim_block,
-                size=fsize,
-                cache_type=cache_type,
-                **kwargs,
-            )
-        return orig_local_open(self, path, mode=mode, block_size=block_size, **kwargs)
-
-    LocalFileSystem._open = traced_local_open
-
-    # Also hook LocalFileOpener.read when sim_block == 0
-    orig_lfo_read = LocalFileOpener.read
-    _ORIGINAL_METHODS["lfo_read"] = orig_lfo_read
-
-    def traced_lfo_read(self: Any, length: int = -1) -> bytes:
-        trace_dir = os.environ.get("GCSFS_IO_TRACE_DIR")
-        if not trace_dir or str(self.path).startswith(trace_dir):
-            return orig_lfo_read(self, length)
-        loc_before = self.f.tell()
-        t0 = time.time()
-        out = orig_lfo_read(self, length)
-        t1 = time.time()
-        actual_len = len(out) if out is not None else 0
-        if actual_len > 0:
-            fsize = 0
-            with contextlib.suppress(Exception):
-                fsize = os.stat(self.path).st_size
-            _LOGGER.log(
-                layer="logical",
-                op="read",
-                file=str(self.path),
-                offset=loc_before,
-                length=actual_len,
-                t_start=t0,
-                t_end=t1,
-                file_size=fsize,
-                cache_hit=False,
-            )
-        return out
-
-    LocalFileOpener.read = traced_lfo_read
-
-    # 5. Hook HuggingFace datasets.utils.file_utils.xopen for local streaming tests
-    with contextlib.suppress(ImportError):
-        import datasets.streaming
-        import datasets.utils.file_utils as hf_file_utils
-
-        orig_xopen = hf_file_utils.xopen
-        _ORIGINAL_METHODS["hf_xopen"] = orig_xopen
-
-        def traced_xopen(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
-            trace_dir = os.environ.get("GCSFS_IO_TRACE_DIR")
-            sim_block = int(os.environ.get("GCSFS_IO_TRACE_LOCAL_BLOCK_SIZE", "0") or 0)
-            file_str = str(file)
-            main_hop = file_str.split("::")[0]
-            if (
-                trace_dir
-                and sim_block > 0
-                and "r" in mode
-                and hf_file_utils.is_local_path(main_hop)
-                and not main_hop.startswith(trace_dir)
-            ):
-                fs = LocalFileSystem()
-                fobj = fs.open(main_hop, mode=mode)
-                return hf_file_utils._add_retries_to_file_obj_read_method(fobj)
-            return orig_xopen(file, mode, *args, **kwargs)
-
-        hf_file_utils.xopen = traced_xopen
-        datasets.streaming.xopen = traced_xopen
-
 
 @contextlib.contextmanager
 def trace_io(
     output_html: str | Path = "io_trace.html",
     *,
     title: str = "Workload I/O Pattern Trace",
-    local_block_size: int = 512 * 1024,
-    local_cache_type: str = "readahead",
-    simulated_wire_latency_ms: float = 1.5,
     keep_raw_events: str | Path | None = None,
 ):
     """Context manager that traces multi-PID Logical & Wire I/O and compiles an interactive HTML dashboard."""
@@ -506,9 +381,6 @@ except Exception:
         for k in (
             "GCSFS_IO_TRACE_DIR",
             "GCSFS_IO_TRACE_T0",
-            "GCSFS_IO_TRACE_LOCAL_BLOCK_SIZE",
-            "GCSFS_IO_TRACE_LOCAL_CACHE_TYPE",
-            "GCSFS_IO_TRACE_SIM_LATENCY_MS",
             "PYTHONPATH",
         )
     }
@@ -516,9 +388,6 @@ except Exception:
     t0 = time.time()
     os.environ["GCSFS_IO_TRACE_DIR"] = trace_dir
     os.environ["GCSFS_IO_TRACE_T0"] = f"{t0:.6f}"
-    os.environ["GCSFS_IO_TRACE_LOCAL_BLOCK_SIZE"] = str(local_block_size)
-    os.environ["GCSFS_IO_TRACE_LOCAL_CACHE_TYPE"] = str(local_cache_type)
-    os.environ["GCSFS_IO_TRACE_SIM_LATENCY_MS"] = str(simulated_wire_latency_ms)
     existing_pp = old_env.get("PYTHONPATH")
     os.environ["PYTHONPATH"] = (
         f"{bootstrap_dir}:{existing_pp}" if existing_pp else bootstrap_dir
