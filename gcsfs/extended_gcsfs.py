@@ -367,6 +367,12 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             self._grpc_client = None
 
     async def _lookup_bucket_layout(self, bucket):
+        if getattr(self, "use_rust_fs", False):
+            return BucketLayout(
+                storage_class=StorageClass.STANDARD,
+                caching_tier=CachingTier.NONE,
+                namespace_layout=NamespaceLayout.NON_HIERARCHICAL,
+            )
         if bucket in self._storage_layout_cache:
             return self._storage_layout_cache[bucket]
         bucket_layout = await self._get_bucket_layout(bucket)

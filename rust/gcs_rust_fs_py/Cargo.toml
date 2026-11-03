@@ -1,0 +1,16 @@
+[package]
+name = "gcs_rust_fs_py"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "gcs_rust_fs_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+gcs-rust-fs = "0.1.0"
+pyo3 = { version = "0.29", features = ["extension-module"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+bytes = "1"

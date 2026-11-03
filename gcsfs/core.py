@@ -458,6 +458,8 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         endpoint_url=None,
         default_location=None,
         version_aware=False,
+        use_rust_fs=False,
+        rust_transport="grpc",
         **kwargs,
     ):
         if cache_timeout is not None:
@@ -484,6 +486,10 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         self.session_kwargs = session_kwargs or {}
         self.default_location = default_location
         self.version_aware = version_aware
+        self.use_rust_fs = bool(
+            use_rust_fs or os.environ.get("GCSFS_USE_RUST_FS", "0") == "1"
+        )
+        self.rust_transport = rust_transport
         self._use_client_cert = _use_client_cert()
         self._use_mtls_endpoint = self._use_client_cert and _use_mtls_endpoint()
         self._ssl_context_task = None
@@ -1269,6 +1275,11 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 "type": "directory",
             }
 
+        if self.use_rust_fs:
+            from .rust_backend import rust_info
+
+            return await rust_info(self, path, generation=generation)
+
         async with parallel_tasks_first_completed(
             [
                 self._get_object(path),
@@ -1284,6 +1295,34 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             except FileNotFoundError:
                 pass
             return await get_directory_info_task
+
+    def info(self, path, generation=None, **kwargs):
+        if self.use_rust_fs and not self.asynchronous:
+            stripped = self._strip_protocol(path).rstrip("/")
+            if "/" in stripped:
+                parent_path = self._parent(stripped)
+                parent_cache = self._ls_from_cache(parent_path)
+                bucket, key, path_generation = self.split_path(stripped)
+                resolved_gen = _coalesce_generation(generation, path_generation)
+                if parent_cache:
+                    name = "/".join((bucket, key))
+                    for o in parent_cache:
+                        if o["name"].rstrip("/") == name and (
+                            not resolved_gen or o.get("generation") == resolved_gen
+                        ):
+                            return o
+                if self._ls_from_cache(stripped):
+                    return {
+                        "bucket": bucket,
+                        "name": stripped,
+                        "size": 0,
+                        "storageClass": "DIRECTORY",
+                        "type": "directory",
+                    }
+                from .rust_backend import rust_info_sync
+
+                return rust_info_sync(self, stripped, generation=resolved_gen)
+        return asyn.sync(self.loop, self._info, path, generation=generation, **kwargs)
 
     async def _get_directory_info(self, path, bucket, key, generation):
         """
@@ -1367,6 +1406,13 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if is_empty_range(start, end):
             return b""
 
+        if self.use_rust_fs:
+            from .rust_backend import rust_cat_file
+
+            return await rust_cat_file(
+                self, path, start=start, end=end, generation=kwargs.get("generation")
+            )
+
         u2 = self.url(path, generation=kwargs.get("generation"))
         if start is not None or end is not None:
             head = {"Range": await self._process_limits(path, start, end)}
@@ -1428,6 +1474,23 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         # to keep it separate because concurrency code path is still in an experimental phase.
         # Once concurrency code path is stabilized, we can remove this if-else condition.
         return await self._cat_file_sequential(path, start=start, end=end, **kwargs)
+
+    def cat_file(self, path, start=None, end=None, **kwargs):
+        if (
+            self.use_rust_fs
+            and not self.asynchronous
+            and kwargs.get("concurrency", 1) == 1
+        ):
+            if is_empty_range(start, end):
+                return b""
+            from .rust_backend import rust_cat_file_sync
+
+            return rust_cat_file_sync(
+                self, path, start=start, end=end, generation=kwargs.get("generation")
+            )
+        return asyn.sync(
+            self.loop, self._cat_file, path, start=start, end=end, **kwargs
+        )
 
     async def _getxattr(self, path, attr):
         """Get user-defined metadata attribute"""
@@ -1835,6 +1898,22 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         consistency = consistency or self.consistency
         bucket, key, generation = self.split_path(path)
         if_generation_match = _resolve_generation_match(mode, if_generation_match)
+        if self.use_rust_fs:
+            from .rust_backend import rust_pipe_file
+
+            out = await rust_pipe_file(
+                self,
+                path,
+                data,
+                content_type=content_type,
+                metadata=metadata,
+                consistency=consistency,
+                mode=mode,
+                if_generation_match=if_generation_match,
+                block_size=chunksize,
+            )
+            await self._write_file_cache_update(path)
+            return out
         size = len(data)
         out = None
         if size < chunksize:
@@ -1879,6 +1958,30 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
 
         await self._write_file_cache_update(path)
         return location
+
+    def pipe_file(self, path, value, **kwargs):
+        if self.use_rust_fs and not self.asynchronous and not self.dircache:
+            consistency = kwargs.get("consistency") or self.consistency
+            mode = kwargs.get("mode", "overwrite")
+            if_generation_match = _resolve_generation_match(
+                mode, kwargs.get("if_generation_match")
+            )
+            from .rust_backend import rust_pipe_file_sync
+
+            out = rust_pipe_file_sync(
+                self,
+                path,
+                value,
+                content_type=kwargs.get("content_type", "application/octet-stream"),
+                metadata=kwargs.get("metadata"),
+                consistency=consistency,
+                mode=mode,
+                if_generation_match=if_generation_match,
+                block_size=kwargs.get("chunksize", 50 * 2**20),
+            )
+            self.invalidate_cache(self._parent(path))
+            return out
+        return asyn.sync(self.loop, self._pipe_file, path, value, **kwargs)
 
     async def _put_file(
         self,
@@ -2852,6 +2955,27 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         final: bool
             Complete and commit upload
         """
+        if getattr(self.gcsfs, "use_rust_fs", False):
+            data_view = self.buffer.getbuffer()
+            l = len(data_view)
+            if (l < GCS_MIN_BLOCK_SIZE) and (not final or not self.autocommit):
+                return False
+            if l > 0:
+                self._rust_writer.write(bytes(data_view))
+                self.checker.update(data_view)
+            if final and self.autocommit:
+                self._rust_writer.close()
+                self._rust_writer = None
+                asyn.sync(
+                    self.gcsfs.loop,
+                    self.gcsfs._write_file_cache_update,
+                    self.path,
+                    timeout=self.timeout,
+                )
+            self.buffer = UnclosableBytesIO()
+            self.offset += l
+            return True
+
         while True:
             # shortfall splits blocks bigger than max allowed upload
             data_view = self.buffer.getbuffer()
@@ -2934,6 +3058,21 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
 
     def _initiate_upload(self):
         """Create multi-upload"""
+        if getattr(self.gcsfs, "use_rust_fs", False):
+            from .rust_backend import rust_open_file
+
+            self._rust_writer = rust_open_file(
+                self.gcsfs,
+                self.path,
+                mode=self.mode,
+                content_type=self.content_type,
+                metadata=self.metadata,
+                block_size=self.blocksize,
+                if_generation_match=self.if_generation_match,
+            )
+            self.location = f"rust://{self.bucket}/{self.key}"
+            return
+
         self.location = asyn.sync(
             self.gcsfs.loop,
             _http_initiate_upload,
@@ -2955,6 +3094,11 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         Should only happen during discarding this write-mode file
         """
         if self.location is None:
+            return
+        if getattr(self.gcsfs, "use_rust_fs", False):
+            self._rust_writer = None
+            self.location = None
+            self.closed = True
             return
         self.gcsfs.call("DELETE", _strip_generation_match(self.location))
         self.location = None
@@ -2990,6 +3134,24 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         """
         if is_empty_range(start, end, self.size):
             return b""
+        if (
+            getattr(self.gcsfs, "use_rust_fs", False)
+            and self.concurrency == 1
+            and start is not None
+            and start >= 0
+            and end is not None
+            and end >= start
+        ):
+            from .rust_backend import rust_open_file
+
+            if getattr(self, "_rust_reader", None) is None:
+                self._rust_reader = rust_open_file(
+                    self.gcsfs,
+                    self.path,
+                    mode="rb",
+                    generation=self.generation,
+                )
+            return self._rust_reader.read_range(start, end)
         try:
             return self.fs.cat_file(
                 self.path,
@@ -3037,6 +3199,10 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         if prefetcher is not None:
             prefetcher.close()
             cache._prefetcher = None
+        rust_reader = getattr(self, "_rust_reader", None)
+        if rust_reader is not None:
+            rust_reader.close()
+            self._rust_reader = None
         super().close()
 
 
@@ -3268,6 +3434,24 @@ async def simple_upload(
     Performs a simple, single-request upload. This function has a conditional path to support
     experimental features for Zonal and RCU buckets to upload data using gRPC.
     """
+    if getattr(fs, "use_rust_fs", False):
+        from .rust_backend import rust_pipe_file
+
+        path = f"{bucket}/{key}"
+        if_generation_match = _resolve_generation_match(mode, if_generation_match)
+        res = await rust_pipe_file(
+            fs,
+            path,
+            datain,
+            content_type=content_type,
+            metadata=metadatain,
+            consistency=consistency,
+            mode=mode,
+            if_generation_match=if_generation_match,
+        )
+        await fs._write_file_cache_update(path)
+        return res
+
     from .extended_gcsfs import ExtendedGcsFileSystem
     from .extended_gcsfs import simple_upload as ext_simple_upload
 
