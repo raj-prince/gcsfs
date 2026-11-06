@@ -523,6 +523,10 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             project, access, token, on_google=self.on_google
         )
         bind_gcs_sync_methods(self)
+        if self.use_rust_fs or self.use_uds_grpc:
+            self.info = self._direct_info_sync
+            self.cat_file = self._direct_cat_file_sync
+            self.pipe_file = self._direct_pipe_file_sync
 
     @property
     def _location(self):
@@ -1319,7 +1323,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 pass
             return await get_directory_info_task
 
-    def info(self, path, generation=None, **kwargs):
+    def _direct_info_sync(self, path, generation=None, **kwargs):
         if (self.use_rust_fs or self.use_uds_grpc) and not self.asynchronous:
             stripped = self._strip_protocol(path).rstrip("/")
             if "/" in stripped:
@@ -1508,7 +1512,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         # Once concurrency code path is stabilized, we can remove this if-else condition.
         return await self._cat_file_sequential(path, start=start, end=end, **kwargs)
 
-    def cat_file(self, path, start=None, end=None, **kwargs):
+    def _direct_cat_file_sync(self, path, start=None, end=None, **kwargs):
         if (
             (self.use_rust_fs or self.use_uds_grpc)
             and not self.asynchronous
@@ -1998,7 +2002,7 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         await self._write_file_cache_update(path)
         return location
 
-    def pipe_file(self, path, value, **kwargs):
+    def _direct_pipe_file_sync(self, path, value, **kwargs):
         if (self.use_rust_fs or self.use_uds_grpc) and not self.asynchronous:
             consistency = kwargs.get("consistency") or self.consistency
             mode = kwargs.get("mode", "overwrite")
@@ -2839,9 +2843,9 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
             mode, if_generation_match
         )
         self.concurrency = kwargs.get("concurrency", DEFAULT_CONCURRENCY)
-        use_direct_backend = bool(
-            getattr(gcsfs, "use_rust_fs", False)
-            or getattr(gcsfs, "use_uds_grpc", False)
+        use_direct_backend = (
+            getattr(gcsfs, "use_rust_fs", False) is True
+            or getattr(gcsfs, "use_uds_grpc", False) is True
         )
         if use_direct_backend:
             self.cache_type, self.cache_source = "none", "none"
@@ -2889,7 +2893,7 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         self._rust_file = None
         preloaded_det = None
         if use_direct_backend and "r" in mode:
-            if getattr(gcsfs, "use_rust_fs", False):
+            if getattr(gcsfs, "use_rust_fs", False) is True:
                 from .rust_backend import rust_file_info, rust_open_file
 
                 self._rust_file = rust_open_file(
@@ -2996,7 +3000,7 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
                 self.blocksize = GCS_MIN_BLOCK_SIZE
             self.location = None
             if use_direct_backend:
-                if getattr(gcsfs, "use_rust_fs", False):
+                if getattr(gcsfs, "use_rust_fs", False) is True:
                     from .rust_backend import rust_open_file
 
                     self._rust_file = rust_open_file(
@@ -3578,7 +3582,7 @@ async def simple_upload(
     Performs a simple, single-request upload. This function has a conditional path to support
     experimental features for Zonal and RCU buckets to upload data using gRPC.
     """
-    if getattr(fs, "use_rust_fs", False):
+    if getattr(fs, "use_rust_fs", False) is True:
         from .rust_backend import rust_pipe_file
 
         path = f"{bucket}/{key}"
