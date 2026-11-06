@@ -2,7 +2,7 @@
 
 Provides ``info``, ``read`` (``cat_file`` and ``RustGcsFile`` streaming/range reads),
 and ``write`` (``pipe_file`` and ``RustGcsFile`` streaming writes) backed by the
-pure-Rust ``gcs-rust-fs`` crate via ``gcs_rust_fs_py``.
+pure-Rust ``gcs-rust-fs`` crate (`CachedFs<GcsFs>` or `RemoteFs` UDS) via ``gcs_rust_fs_py``.
 """
 
 from __future__ import annotations
@@ -32,16 +32,10 @@ def _require_rust_bridge():
 
 
 def _resolve_rust_write_mode(mode: str, if_generation_match: int | None) -> str:
-    """Map gcsfs write mode and generation preconditions to gcs-rust-fs WriteMode.
-
-    Note: ``gcs-rust-fs`` v0.1.0 exposes ``WriteMode::Overwrite`` and
-    ``WriteMode::Create`` (which maps to ``if_generation_match(0)``), but does
-    not expose arbitrary ``if_generation_match(N)`` for ``N > 0`` on
-    ``WriteOptions``.
-    """
+    """Map gcsfs write mode and generation preconditions to gcs-rust-fs WriteMode."""
     if if_generation_match not in (None, 0):
         raise NotImplementedError(
-            "gcs-rust-fs v0.1.0 only supports if_generation_match=0 (create mode); "
+            "gcs-rust-fs only supports if_generation_match=0 (create mode); "
             f"got if_generation_match={if_generation_match!r}"
         )
     if mode == "create" or if_generation_match == 0:
@@ -64,17 +58,32 @@ def _finalize_info_dict(fs: GCSFileSystem, raw: dict[str, Any]) -> dict[str, Any
     return result
 
 
+def rust_file_info(fs: GCSFileSystem, handle: Any) -> dict[str, Any] | None:
+    """Extract and finalize metadata dict from an open ``RustGcsFile`` handle."""
+    info_fn = getattr(handle, "info", None)
+    if info_fn is None:
+        return None
+    raw = info_fn()
+    if not raw or not isinstance(raw, dict):
+        return None
+    return _finalize_info_dict(fs, raw)
+
+
 async def rust_info(
     fs: GCSFileSystem, path: str, generation: str | int | None = None
 ) -> dict[str, Any]:
-    """Fetch object or prefix metadata via ``gcs-rust-fs`` ``StorageControl`` gRPC."""
+    """Fetch object or prefix metadata via ``gcs-rust-fs``."""
     bridge = _require_rust_bridge()
     gen_str = str(generation) if generation is not None else None
+    uncached = getattr(fs, "cache_timeout", None) == 0
+    uds_path = getattr(fs, "rust_uds_path", None)
     raw = await bridge.info_async(
         path,
         generation=gen_str,
         transport=fs.rust_transport,
         endpoint=fs._endpoint,
+        uncached=uncached,
+        uds_path=uds_path,
     )
     return _finalize_info_dict(fs, raw)
 
@@ -85,11 +94,15 @@ def rust_info_sync(
     """Synchronous fast path for ``info`` without hopping through fsspec's asyncio loop thread."""
     bridge = _require_rust_bridge()
     gen_str = str(generation) if generation is not None else None
+    uncached = getattr(fs, "cache_timeout", None) == 0
+    uds_path = getattr(fs, "rust_uds_path", None)
     raw = bridge.info(
         path,
         generation=gen_str,
         transport=fs.rust_transport,
         endpoint=fs._endpoint,
+        uncached=uncached,
+        uds_path=uds_path,
     )
     return _finalize_info_dict(fs, raw)
 
@@ -104,6 +117,7 @@ async def rust_cat_file(
     """Read an entire object or byte sub-range via ``gcs-rust-fs``."""
     bridge = _require_rust_bridge()
     gen_str = str(generation) if generation is not None else None
+    uds_path = getattr(fs, "rust_uds_path", None)
     return await bridge.cat_file_async(
         path,
         start=start,
@@ -111,6 +125,7 @@ async def rust_cat_file(
         generation=gen_str,
         transport=fs.rust_transport,
         endpoint=fs._endpoint,
+        uds_path=uds_path,
     )
 
 
@@ -124,6 +139,7 @@ def rust_cat_file_sync(
     """Synchronous fast path for ``cat_file`` without hopping through fsspec's asyncio loop thread."""
     bridge = _require_rust_bridge()
     gen_str = str(generation) if generation is not None else None
+    uds_path = getattr(fs, "rust_uds_path", None)
     return bridge.cat_file(
         path,
         start=start,
@@ -131,6 +147,7 @@ def rust_cat_file_sync(
         generation=gen_str,
         transport=fs.rust_transport,
         endpoint=fs._endpoint,
+        uds_path=uds_path,
     )
 
 
@@ -165,6 +182,7 @@ async def rust_pipe_file(
     bridge = _require_rust_bridge()
     effective_mode = _resolve_rust_write_mode(mode, if_generation_match)
     payload = data if isinstance(data, bytes) else bytes(data)
+    uds_path = getattr(fs, "rust_uds_path", None)
     await bridge.pipe_file_async(
         path,
         payload,
@@ -173,6 +191,7 @@ async def rust_pipe_file(
         mode=effective_mode,
         transport=fs.rust_transport,
         endpoint=fs._endpoint,
+        uds_path=uds_path,
     )
     return _validate_and_build_pipe_response(payload, consistency)
 
@@ -192,6 +211,7 @@ def rust_pipe_file_sync(
     bridge = _require_rust_bridge()
     effective_mode = _resolve_rust_write_mode(mode, if_generation_match)
     payload = data if isinstance(data, bytes) else bytes(data)
+    uds_path = getattr(fs, "rust_uds_path", None)
     bridge.pipe_file(
         path,
         payload,
@@ -200,6 +220,7 @@ def rust_pipe_file_sync(
         mode=effective_mode,
         transport=fs.rust_transport,
         endpoint=fs._endpoint,
+        uds_path=uds_path,
     )
     return _validate_and_build_pipe_response(payload, consistency)
 
@@ -214,7 +235,7 @@ def rust_open_file(
     generation: str | int | None = None,
     if_generation_match: int | None = None,
 ):
-    """Open a streaming ``RustGcsFile`` handle backed by ``gcs_rust_fs::GcsFile``."""
+    """Open a streaming ``RustGcsFile`` handle backed by ``gcs_rust_fs``."""
     bridge = _require_rust_bridge()
     if "w" in mode or "x" in mode:
         effective_write_mode = _resolve_rust_write_mode(
@@ -224,6 +245,7 @@ def rust_open_file(
     else:
         open_mode = "rb"
     gen_str = str(generation) if generation is not None else None
+    uds_path = getattr(fs, "rust_uds_path", None)
     return bridge.RustGcsFile.open_sync(
         path,
         mode=open_mode,
@@ -233,4 +255,5 @@ def rust_open_file(
         generation=gen_str,
         transport=fs.rust_transport,
         endpoint=fs._endpoint,
+        uds_path=uds_path,
     )

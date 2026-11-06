@@ -318,3 +318,132 @@ def test_open_write_and_read_file_handle(
     # Assert
     assert first_slice + rest_slice == payload
     assert fs.info(path)["size"] == payload_size
+
+
+def test_open_seek_tell_and_zero_fsspec_loop(rust_testbench_endpoint):
+    # Arrange
+    endpoint, bucket = rust_testbench_endpoint
+    fs = gcsfs.GCSFileSystem(
+        project="test-project" if endpoint else None,
+        token="anon" if endpoint else "google_default",
+        endpoint_url=endpoint,
+        use_rust_fs=True,
+        rust_transport="http",
+        cache_timeout=0,
+    )
+    path = f"{bucket}/poc-rust-fs/seek-{uuid.uuid4().hex[:6]}.bin"
+    payload = bytes(range(256)) * 4096  # 1 MiB
+
+    # Act
+    with fs.open(path, "wb") as writer:
+        writer.write(payload[:524288])
+        writer.write(payload[524288:])
+
+    info = fs.info(path)
+    with fs.open(path, "rb") as reader:
+        assert reader.cache_type == "none"
+        assert reader.size == len(payload)
+        assert reader.tell() == 0
+        head = reader.read(64)
+        assert reader.tell() == 64
+        pos = reader.seek(524288)
+        assert pos == 524288
+        assert reader.tell() == 524288
+        mid = reader.read(128)
+        assert reader.tell() == 524288 + 128
+        end_pos = reader.seek(-32, 2)
+        assert end_pos == len(payload) - 32
+        tail = reader.read()
+
+    # Assert
+    assert info["size"] == len(payload)
+    assert head == payload[:64]
+    assert mid == payload[524288 : 524288 + 128]
+    assert tail == payload[-32:]
+    assert fs._loop is None
+
+
+def test_uds_sidecar_scenarios_3_and_4(rust_testbench_endpoint, tmp_path):
+    # Arrange
+    import subprocess
+    import time
+
+    sidecar_bin = "/home/princer_google_com/dev/gcs-rust-fs/target/release/gcsfs-sidecar"
+    if not os.path.exists(sidecar_bin):
+        pytest.skip(f"gcsfs-sidecar binary not found at {sidecar_bin}")
+
+    endpoint, bucket = rust_testbench_endpoint
+    sock_path = str(tmp_path / "test-gcsfs-sidecar.sock")
+    env = os.environ.copy()
+    if endpoint:
+        env["STORAGE_EMULATOR_HOST"] = endpoint
+    proc = subprocess.Popen(
+        [
+            sidecar_bin,
+            "--uds",
+            sock_path,
+            "--transport",
+            "http",
+            "--readahead",
+            "--http-pool-size",
+            "4",
+        ],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + 10.0
+        while not os.path.exists(sock_path):
+            if proc.poll() is not None:
+                stderr = proc.stderr.read().decode("utf-8", errors="replace")
+                pytest.fail(f"gcsfs-sidecar exited early: {stderr}")
+            if time.monotonic() > deadline:
+                pytest.fail("Timed out waiting for gcsfs-sidecar UDS socket")
+            time.sleep(0.05)
+
+        fs_s3 = gcsfs.GCSFileSystem(
+            project="test-project" if endpoint else None,
+            token="anon" if endpoint else "google_default",
+            endpoint_url=endpoint,
+            use_uds_grpc=True,
+            uds_socket_path=sock_path,
+            cache_timeout=0,
+        )
+        fs_s4 = gcsfs.GCSFileSystem(
+            project="test-project" if endpoint else None,
+            token="anon" if endpoint else "google_default",
+            endpoint_url=endpoint,
+            use_rust_fs=True,
+            rust_uds_path=sock_path,
+            cache_timeout=0,
+        )
+
+        for label, fs in [("scenario3_grpc_aio", fs_s3), ("scenario4_remotefs", fs_s4)]:
+            path = f"{bucket}/poc-rust-fs/{label}-{uuid.uuid4().hex[:6]}.bin"
+            payload = (b"UdsSidecarTest-" * 70000)[: 1024 * 1024]  # 1 MiB
+            fs.pipe_file(path, payload, content_type="application/octet-stream")
+            info = fs.info(path)
+            assert info["size"] == len(payload)
+            assert fs.cat_file(path, start=100, end=250) == payload[100:250]
+
+            with fs.open(path, "rb") as f:
+                assert f.read(256) == payload[:256]
+                assert f.read(512) == payload[256:768]
+                f.seek(500000)
+                assert f.read(1024) == payload[500000:501024]
+                assert f.read(1024) == payload[501024:502048]
+
+            stream_path = f"{bucket}/poc-rust-fs/{label}-stream-{uuid.uuid4().hex[:6]}.bin"
+            with fs.open(stream_path, "wb") as wf:
+                wf.write(payload[:524288])
+                wf.write(payload[524288:])
+            assert fs.cat_file(stream_path) == payload
+            assert fs._loop is None
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+

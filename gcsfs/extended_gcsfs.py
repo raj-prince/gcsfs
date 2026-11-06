@@ -236,7 +236,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         weakref.finalize(
             self,
             self._finalize_mrd_pool_cache,
-            self.loop,
+            self._loop,
             self._mrd_pool_cache,
         )
 
@@ -367,7 +367,7 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             self._grpc_client = None
 
     async def _lookup_bucket_layout(self, bucket):
-        if getattr(self, "use_rust_fs", False):
+        if getattr(self, "use_rust_fs", False) or getattr(self, "use_uds_grpc", False):
             return BucketLayout(
                 storage_class=StorageClass.STANDARD,
                 caching_tier=CachingTier.NONE,
@@ -482,13 +482,19 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         """
         Open a file.
         """
-        bucket, _, _ = self.split_path(path)
-        bucket_layout = self._sync_lookup_bucket_layout(bucket)
-        use_zonal_file = "+" not in mode and bucket_layout.uses_grpc_data_path
-        file_cls = ZonalFile if use_zonal_file else GCSFile
-        finalize_on_close = self._resolve_finalize_on_close(
-            bucket_layout, kwargs.pop("finalize_on_close", None)
-        )
+        if getattr(self, "use_rust_fs", False) or getattr(self, "use_uds_grpc", False):
+            file_cls = GCSFile
+            finalize_on_close = self._resolve_finalize_on_close(
+                BucketLayout.UNKNOWN, kwargs.pop("finalize_on_close", None)
+            )
+        else:
+            bucket, _, _ = self.split_path(path)
+            bucket_layout = self._sync_lookup_bucket_layout(bucket)
+            use_zonal_file = "+" not in mode and bucket_layout.uses_grpc_data_path
+            file_cls = ZonalFile if use_zonal_file else GCSFile
+            finalize_on_close = self._resolve_finalize_on_close(
+                bucket_layout, kwargs.pop("finalize_on_close", None)
+            )
 
         return file_cls(
             self,

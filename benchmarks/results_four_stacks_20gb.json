@@ -1,0 +1,454 @@
+{
+  "s1_python": {
+    "part1_info": {
+      "iterations": 30,
+      "mean_ms": 22.52,
+      "min_ms": 16.18,
+      "p50_ms": 22.24,
+      "p90_ms": 25.7,
+      "p99_ms": 32.22,
+      "max_ms": 34.57
+    },
+    "part2_random_read": {
+      "reads": 50,
+      "read_size_bytes": 1048576,
+      "wall_s": 1.946,
+      "p50_ms": 39.11,
+      "p90_ms": 44.83,
+      "p99_ms": 54.71,
+      "iops": 25.7,
+      "mb_s": 26.95,
+      "mib_s": 25.7
+    },
+    "part4_write": {
+      "write_size_mib": 200,
+      "streaming_write": {
+        "iterations": 5,
+        "mean_s": 1.997,
+        "p50_s": 1.997,
+        "p90_s": 2.075,
+        "mb_s_p50": 105.02,
+        "mib_s_p50": 100.16
+      },
+      "pipe_file": {
+        "iterations": 5,
+        "mean_s": 1.386,
+        "p50_s": 1.408,
+        "p90_s": 1.486,
+        "mb_s_p50": 148.97,
+        "mib_s_p50": 142.07
+      }
+    },
+    "part3_sequential": {
+      "1": {
+        "concurrency": "1",
+        "workers": 1,
+        "mode": "thread",
+        "wall_s": 27.73,
+        "total_bytes": 21474836480,
+        "total_gib": 20.0,
+        "target_gib": 20,
+        "time_capped": false,
+        "chunk_p50_ms": 6.56,
+        "chunk_p90_ms": 20.56,
+        "mb_s": 774.43,
+        "mib_s": 738.56
+      },
+      "24T": {
+        "concurrency": "24T",
+        "workers": 24,
+        "mode": "thread",
+        "wall_s": 122.01,
+        "total_bytes": 80010543104,
+        "total_gib": 74.52,
+        "target_gib": 480,
+        "time_capped": true,
+        "chunk_p50_ms": 73.59,
+        "chunk_p90_ms": 820.89,
+        "mb_s": 655.74,
+        "mib_s": 625.37
+      },
+      "24P": {
+        "concurrency": "24P",
+        "workers": 24,
+        "mode": "process",
+        "wall_s": 43.37,
+        "total_bytes": 515396075520,
+        "total_gib": 480.0,
+        "target_gib": 480,
+        "time_capped": false,
+        "chunk_p50_ms": 4.13,
+        "chunk_p90_ms": 36.64,
+        "mb_s": 11883.23,
+        "mib_s": 11332.73
+      },
+      "48T": {
+        "concurrency": "48T",
+        "workers": 48,
+        "mode": "thread",
+        "wall_s": 124.5,
+        "total_bytes": 80572579840,
+        "total_gib": 75.04,
+        "target_gib": 960,
+        "time_capped": true,
+        "chunk_p50_ms": 71.57,
+        "chunk_p90_ms": 1004.34,
+        "mb_s": 647.16,
+        "mib_s": 617.18
+      },
+      "48P": {
+        "concurrency": "48P",
+        "workers": 48,
+        "mode": "process",
+        "wall_s": 61.98,
+        "total_bytes": 1030792151040,
+        "total_gib": 960.0,
+        "target_gib": 960,
+        "time_capped": false,
+        "chunk_p50_ms": 1.81,
+        "chunk_p90_ms": 72.59,
+        "mb_s": 16631.72,
+        "mib_s": 15861.24
+      }
+    }
+  },
+  "s2_pyo3_direct": {
+    "part1_info": {
+      "iterations": 30,
+      "mean_ms": 26.21,
+      "min_ms": 19.02,
+      "p50_ms": 25.95,
+      "p90_ms": 32.43,
+      "p99_ms": 34.94,
+      "max_ms": 35.47
+    },
+    "part2_random_read": {
+      "reads": 50,
+      "read_size_bytes": 1048576,
+      "wall_s": 2.3,
+      "p50_ms": 44.43,
+      "p90_ms": 56.46,
+      "p99_ms": 81.46,
+      "iops": 21.74,
+      "mb_s": 22.8,
+      "mib_s": 21.74
+    },
+    "part4_write": {
+      "write_size_mib": 200,
+      "streaming_write": {
+        "iterations": 5,
+        "mean_s": 2.132,
+        "p50_s": 2.107,
+        "p90_s": 2.186,
+        "mb_s_p50": 99.53,
+        "mib_s_p50": 94.92
+      },
+      "pipe_file": {
+        "iterations": 5,
+        "mean_s": 1.006,
+        "p50_s": 0.957,
+        "p90_s": 1.109,
+        "mb_s_p50": 219.24,
+        "mib_s_p50": 209.08
+      }
+    },
+    "part3_sequential": {
+      "1": {
+        "concurrency": "1",
+        "workers": 1,
+        "mode": "thread",
+        "wall_s": 6.27,
+        "total_bytes": 21474836480,
+        "total_gib": 20.0,
+        "target_gib": 20,
+        "time_capped": false,
+        "chunk_p50_ms": 1.05,
+        "chunk_p90_ms": 3.93,
+        "mb_s": 3425.15,
+        "mib_s": 3266.48
+      },
+      "24T": {
+        "concurrency": "24T",
+        "workers": 24,
+        "mode": "thread",
+        "wall_s": 89.7,
+        "total_bytes": 515396075520,
+        "total_gib": 480.0,
+        "target_gib": 480,
+        "time_capped": false,
+        "chunk_p50_ms": 1.42,
+        "chunk_p90_ms": 117.08,
+        "mb_s": 5745.57,
+        "mib_s": 5479.4
+      },
+      "24P": {
+        "concurrency": "24P",
+        "workers": 24,
+        "mode": "process",
+        "wall_s": 30.13,
+        "total_bytes": 515396075520,
+        "total_gib": 480.0,
+        "target_gib": 480,
+        "time_capped": false,
+        "chunk_p50_ms": 2.07,
+        "chunk_p90_ms": 38.03,
+        "mb_s": 17107.49,
+        "mib_s": 16314.97
+      },
+      "48T": {
+        "concurrency": "48T",
+        "workers": 48,
+        "mode": "thread",
+        "wall_s": 120.11,
+        "total_bytes": 668764995584,
+        "total_gib": 622.84,
+        "target_gib": 960,
+        "time_capped": true,
+        "chunk_p50_ms": 1.54,
+        "chunk_p90_ms": 249.95,
+        "mb_s": 5567.89,
+        "mib_s": 5309.96
+      },
+      "48P": {
+        "concurrency": "48P",
+        "workers": 48,
+        "mode": "process",
+        "wall_s": 50.88,
+        "total_bytes": 1030792151040,
+        "total_gib": 960.0,
+        "target_gib": 960,
+        "time_capped": false,
+        "chunk_p50_ms": 2.35,
+        "chunk_p90_ms": 61.74,
+        "mb_s": 20257.41,
+        "mib_s": 19318.97
+      }
+    }
+  },
+  "s3_uds_grpc_aio": {
+    "part1_info": {
+      "iterations": 30,
+      "mean_ms": 26.22,
+      "min_ms": 17.84,
+      "p50_ms": 25.71,
+      "p90_ms": 33.6,
+      "p99_ms": 36.44,
+      "max_ms": 37.36
+    },
+    "part2_random_read": {
+      "reads": 50,
+      "read_size_bytes": 1048576,
+      "wall_s": 2.448,
+      "p50_ms": 48.64,
+      "p90_ms": 58.25,
+      "p99_ms": 68.53,
+      "iops": 20.43,
+      "mb_s": 21.42,
+      "mib_s": 20.43
+    },
+    "part4_write": {
+      "write_size_mib": 200,
+      "streaming_write": {
+        "iterations": 5,
+        "mean_s": 2.077,
+        "p50_s": 2.065,
+        "p90_s": 2.175,
+        "mb_s_p50": 101.55,
+        "mib_s_p50": 96.84
+      },
+      "pipe_file": {
+        "iterations": 5,
+        "mean_s": 2.094,
+        "p50_s": 2.123,
+        "p90_s": 2.131,
+        "mb_s_p50": 98.79,
+        "mib_s_p50": 94.22
+      }
+    },
+    "part3_sequential": {
+      "1": {
+        "concurrency": "1",
+        "workers": 1,
+        "mode": "thread",
+        "wall_s": 22.39,
+        "total_bytes": 21474836480,
+        "total_gib": 20.0,
+        "target_gib": 20,
+        "time_capped": false,
+        "chunk_p50_ms": 6.67,
+        "chunk_p90_ms": 16.13,
+        "mb_s": 959.21,
+        "mib_s": 914.77
+      },
+      "24T": {
+        "concurrency": "24T",
+        "workers": 24,
+        "mode": "thread",
+        "wall_s": 120.2,
+        "total_bytes": 158997676032,
+        "total_gib": 148.08,
+        "target_gib": 480,
+        "time_capped": true,
+        "chunk_p50_ms": 144.21,
+        "chunk_p90_ms": 187.63,
+        "mb_s": 1322.75,
+        "mib_s": 1261.47
+      },
+      "24P": {
+        "concurrency": "24P",
+        "workers": 24,
+        "mode": "process",
+        "wall_s": 50.69,
+        "total_bytes": 515396075520,
+        "total_gib": 480.0,
+        "target_gib": 480,
+        "time_capped": false,
+        "chunk_p50_ms": 14.28,
+        "chunk_p90_ms": 32.32,
+        "mb_s": 10167.1,
+        "mib_s": 9696.1
+      },
+      "48T": {
+        "concurrency": "48T",
+        "workers": 48,
+        "mode": "thread",
+        "wall_s": 120.26,
+        "total_bytes": 156455927808,
+        "total_gib": 145.71,
+        "target_gib": 960,
+        "time_capped": true,
+        "chunk_p50_ms": 294.05,
+        "chunk_p90_ms": 412.94,
+        "mb_s": 1300.95,
+        "mib_s": 1240.68
+      },
+      "48P": {
+        "concurrency": "48P",
+        "workers": 48,
+        "mode": "process",
+        "wall_s": 88.85,
+        "total_bytes": 1030792151040,
+        "total_gib": 960.0,
+        "target_gib": 960,
+        "time_capped": false,
+        "chunk_p50_ms": 22.22,
+        "chunk_p90_ms": 53.07,
+        "mb_s": 11601.92,
+        "mib_s": 11064.45
+      }
+    }
+  },
+  "s4_pyo3_remotefs": {
+    "part1_info": {
+      "iterations": 30,
+      "mean_ms": 27.06,
+      "min_ms": 20.47,
+      "p50_ms": 26.64,
+      "p90_ms": 31.66,
+      "p99_ms": 32.54,
+      "max_ms": 32.56
+    },
+    "part2_random_read": {
+      "reads": 50,
+      "read_size_bytes": 1048576,
+      "wall_s": 2.075,
+      "p50_ms": 41.12,
+      "p90_ms": 49.19,
+      "p99_ms": 54.73,
+      "iops": 24.1,
+      "mb_s": 25.27,
+      "mib_s": 24.1
+    },
+    "part4_write": {
+      "write_size_mib": 200,
+      "streaming_write": {
+        "iterations": 5,
+        "mean_s": 2.06,
+        "p50_s": 2.055,
+        "p90_s": 2.129,
+        "mb_s_p50": 102.06,
+        "mib_s_p50": 97.33
+      },
+      "pipe_file": {
+        "iterations": 5,
+        "mean_s": 1.981,
+        "p50_s": 1.977,
+        "p90_s": 2.043,
+        "mb_s_p50": 106.08,
+        "mib_s_p50": 101.17
+      }
+    },
+    "part3_sequential": {
+      "1": {
+        "concurrency": "1",
+        "workers": 1,
+        "mode": "thread",
+        "wall_s": 7.69,
+        "total_bytes": 21474836480,
+        "total_gib": 20.0,
+        "target_gib": 20,
+        "time_capped": false,
+        "chunk_p50_ms": 2.21,
+        "chunk_p90_ms": 4.89,
+        "mb_s": 2791.67,
+        "mib_s": 2662.35
+      },
+      "24T": {
+        "concurrency": "24T",
+        "workers": 24,
+        "mode": "thread",
+        "wall_s": 92.47,
+        "total_bytes": 515396075520,
+        "total_gib": 480.0,
+        "target_gib": 480,
+        "time_capped": false,
+        "chunk_p50_ms": 18.67,
+        "chunk_p90_ms": 88.62,
+        "mb_s": 5573.73,
+        "mib_s": 5315.52
+      },
+      "24P": {
+        "concurrency": "24P",
+        "workers": 24,
+        "mode": "process",
+        "wall_s": 27.71,
+        "total_bytes": 515396075520,
+        "total_gib": 480.0,
+        "target_gib": 480,
+        "time_capped": false,
+        "chunk_p50_ms": 9.51,
+        "chunk_p90_ms": 14.1,
+        "mb_s": 18598.15,
+        "mib_s": 17736.58
+      },
+      "48T": {
+        "concurrency": "48T",
+        "workers": 48,
+        "mode": "thread",
+        "wall_s": 120.09,
+        "total_bytes": 644790353920,
+        "total_gib": 600.51,
+        "target_gib": 960,
+        "time_capped": true,
+        "chunk_p50_ms": 28.98,
+        "chunk_p90_ms": 206.05,
+        "mb_s": 5369.23,
+        "mib_s": 5120.5
+      },
+      "48P": {
+        "concurrency": "48P",
+        "workers": 48,
+        "mode": "process",
+        "wall_s": 50.48,
+        "total_bytes": 1030792151040,
+        "total_gib": 960.0,
+        "target_gib": 960,
+        "time_capped": false,
+        "chunk_p50_ms": 18.23,
+        "chunk_p90_ms": 23.23,
+        "mb_s": 20420.3,
+        "mib_s": 19474.32
+      }
+    }
+  }
+}

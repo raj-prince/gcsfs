@@ -1,6 +1,6 @@
 [package]
 name = "gcs_rust_fs_py"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 publish = false
 
@@ -9,7 +9,7 @@ name = "gcs_rust_fs_py"
 crate-type = ["cdylib"]
 
 [dependencies]
-gcs-rust-fs = "0.1.0"
+gcs-rust-fs = { version = "0.1.1", path = "/home/princer_google_com/dev/gcs-rust-fs" }
 pyo3 = { version = "0.29", features = ["extension-module"] }
 pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
