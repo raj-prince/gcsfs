@@ -367,7 +367,10 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
             self._grpc_client = None
 
     async def _lookup_bucket_layout(self, bucket):
-        if getattr(self, "use_rust_fs", False) or getattr(self, "use_uds_grpc", False):
+        if (
+            getattr(self, "use_rust_fs", False) is True
+            or getattr(self, "use_uds_grpc", False) is True
+        ):
             return BucketLayout(
                 storage_class=StorageClass.STANDARD,
                 caching_tier=CachingTier.NONE,
@@ -482,7 +485,10 @@ class ExtendedGcsFileSystem(HnsDirCacheUpdater, GCSFileSystem):
         """
         Open a file.
         """
-        if getattr(self, "use_rust_fs", False) or getattr(self, "use_uds_grpc", False):
+        if (
+            getattr(self, "use_rust_fs", False) is True
+            or getattr(self, "use_uds_grpc", False) is True
+        ):
             file_cls = GCSFile
             finalize_on_close = self._resolve_finalize_on_close(
                 BucketLayout.UNKNOWN, kwargs.pop("finalize_on_close", None)
