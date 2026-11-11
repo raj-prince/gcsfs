@@ -24,6 +24,148 @@ import gcsfs
 
 SIDECAR_BIN = "/home/princer_google_com/dev/gcs-rust-fs/target/release/gcsfs-sidecar"
 DEFAULT_UDS_SOCK = "/tmp/gcsfs-sidecar-bench.sock"
+CLK_TCK = int(os.sysconf("SC_CLK_TCK"))
+
+
+def _read_pid_ticks_and_rss_kb(pid: int) -> tuple[int, int] | None:
+    """Return (utime+stime in clock ticks, VmRSS in KiB) for `pid`, or None if exited."""
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as f:
+            stat_str = f.read()
+        rparen = stat_str.rfind(")")
+        if rparen < 0:
+            return None
+        fields = stat_str[rparen + 2 :].split()
+        ticks = int(fields[11]) + int(fields[12])
+
+        rss_kb = 0
+        with open(f"/proc/{pid}/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    rss_kb = int(line.split()[1])
+                    break
+        return ticks, rss_kb
+    except OSError:
+        return None
+
+
+class ProcessResourceSampler:
+    """Samples CPU ticks and VmRSS across client PID(s) and optional sidecar PID at 50ms intervals."""
+
+    def __init__(
+        self,
+        client_pids: list[int] | None = None,
+        sidecar_pid: int | None = None,
+        interval_s: float = 0.05,
+    ) -> None:
+        self.client_pids = list(client_pids) if client_pids else [os.getpid()]
+        self.sidecar_pid = sidecar_pid
+        self.interval_s = interval_s
+        self._stop_evt = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._t_start = 0.0
+        self._init_client_ticks: dict[int, int] = {}
+        self._last_client_ticks: dict[int, int] = {}
+        self._init_sidecar_ticks = 0
+        self._last_sidecar_ticks = 0
+        self._client_rss_samples_kb: list[int] = []
+        self._sidecar_rss_samples_kb: list[int] = []
+        self._total_rss_samples_kb: list[int] = []
+
+    def _sample_once(self, is_init: bool = False) -> None:
+        c_rss_sum = 0
+        for pid in self.client_pids:
+            res = _read_pid_ticks_and_rss_kb(pid)
+            if res is not None:
+                ticks, rss_kb = res
+                if is_init or pid not in self._init_client_ticks:
+                    self._init_client_ticks[pid] = ticks
+                self._last_client_ticks[pid] = ticks
+                c_rss_sum += rss_kb
+
+        s_rss = 0
+        if self.sidecar_pid is not None:
+            res = _read_pid_ticks_and_rss_kb(self.sidecar_pid)
+            if res is not None:
+                ticks, rss_kb = res
+                if is_init:
+                    self._init_sidecar_ticks = ticks
+                self._last_sidecar_ticks = ticks
+                s_rss = rss_kb
+
+        self._client_rss_samples_kb.append(c_rss_sum)
+        self._sidecar_rss_samples_kb.append(s_rss)
+        self._total_rss_samples_kb.append(c_rss_sum + s_rss)
+
+    def _run_loop(self) -> None:
+        while not self._stop_evt.wait(self.interval_s):
+            self._sample_once(is_init=False)
+
+    def start(self) -> ProcessResourceSampler:
+        self._t_start = time.perf_counter()
+        self._sample_once(is_init=True)
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> dict[str, float]:
+        self._stop_evt.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        self._sample_once(is_init=False)
+        wall_s = max(1e-6, time.perf_counter() - self._t_start)
+
+        client_delta_ticks = sum(
+            max(0, self._last_client_ticks.get(pid, 0) - init_t)
+            for pid, init_t in self._init_client_ticks.items()
+        )
+        sidecar_delta_ticks = (
+            max(0, self._last_sidecar_ticks - self._init_sidecar_ticks)
+            if self.sidecar_pid is not None
+            else 0
+        )
+
+        client_cpu_cores = (client_delta_ticks / CLK_TCK) / wall_s
+        sidecar_cpu_cores = (sidecar_delta_ticks / CLK_TCK) / wall_s
+        total_cpu_cores = client_cpu_cores + sidecar_cpu_cores
+
+        avg_total_rss_mib = (
+            (sum(self._total_rss_samples_kb) / len(self._total_rss_samples_kb)) / 1024.0
+            if self._total_rss_samples_kb
+            else 0.0
+        )
+        peak_total_rss_mib = (
+            max(self._total_rss_samples_kb) / 1024.0 if self._total_rss_samples_kb else 0.0
+        )
+        avg_client_rss_mib = (
+            (sum(self._client_rss_samples_kb) / len(self._client_rss_samples_kb)) / 1024.0
+            if self._client_rss_samples_kb
+            else 0.0
+        )
+        peak_client_rss_mib = (
+            max(self._client_rss_samples_kb) / 1024.0 if self._client_rss_samples_kb else 0.0
+        )
+        avg_sidecar_rss_mib = (
+            (sum(self._sidecar_rss_samples_kb) / len(self._sidecar_rss_samples_kb)) / 1024.0
+            if self._sidecar_rss_samples_kb
+            else 0.0
+        )
+        peak_sidecar_rss_mib = (
+            max(self._sidecar_rss_samples_kb) / 1024.0 if self._sidecar_rss_samples_kb else 0.0
+        )
+
+        return {
+            "avg_cpu_pct": round(total_cpu_cores * 100.0, 1),
+            "avg_cpu_cores": round(total_cpu_cores, 2),
+            "client_cpu_cores": round(client_cpu_cores, 2),
+            "sidecar_cpu_cores": round(sidecar_cpu_cores, 2),
+            "avg_rss_mib": round(avg_total_rss_mib, 1),
+            "peak_rss_mib": round(peak_total_rss_mib, 1),
+            "client_avg_rss_mib": round(avg_client_rss_mib, 1),
+            "client_peak_rss_mib": round(peak_client_rss_mib, 1),
+            "sidecar_avg_rss_mib": round(avg_sidecar_rss_mib, 1),
+            "sidecar_peak_rss_mib": round(peak_sidecar_rss_mib, 1),
+        }
 
 SCENARIO_LABELS = {
     "s1_python": "Scenario 1: Pure Python gcsfs (Stack 2)",
@@ -177,17 +319,25 @@ class SidecarManager:
 
 
 def run_part1_info(
-    scenario: str, path: str, uds_sock: str, iterations: int = 30
+    scenario: str,
+    path: str,
+    uds_sock: str,
+    iterations: int = 30,
+    sidecar_pid: int | None = None,
 ) -> dict[str, Any]:
     fs = make_fs(scenario, uds_sock)
     # Warm up connection/channel once
     _ = fs.info(path)
+    sampler = ProcessResourceSampler(
+        client_pids=[os.getpid()], sidecar_pid=sidecar_pid, interval_s=0.02
+    ).start()
     latencies_ms: list[float] = []
     for _ in range(iterations):
         t0 = time.perf_counter()
         info = fs.info(path)
         latencies_ms.append((time.perf_counter() - t0) * 1000.0)
         assert info["size"] > 0
+    resources = sampler.stop()
     s = sorted(latencies_ms)
     mean_ms = sum(s) / len(s)
     res = {
@@ -198,10 +348,13 @@ def run_part1_info(
         "p90_ms": round(percentile(s, 90.0), 2),
         "p99_ms": round(percentile(s, 99.0), 2),
         "max_ms": round(s[-1], 2),
+        "resources": resources,
     }
     print(
         f"    Part 1 [info 30x] ({scenario}): mean={res['mean_ms']}ms, "
-        f"min={res['min_ms']}ms, p50={res['p50_ms']}ms, p90={res['p90_ms']}ms, p99={res['p99_ms']}ms",
+        f"min={res['min_ms']}ms, p50={res['p50_ms']}ms, p90={res['p90_ms']}ms, p99={res['p99_ms']}ms | "
+        f"CPU={resources['avg_cpu_pct']}% ({resources['avg_cpu_cores']}c), "
+        f"RSS={resources['avg_rss_mib']}/{resources['peak_rss_mib']} MiB",
         flush=True,
     )
     return res
@@ -213,6 +366,7 @@ def run_part2_random_read(
     uds_sock: str,
     read_size: int = 1024 * 1024,
     num_reads: int = 50,
+    sidecar_pid: int | None = None,
 ) -> dict[str, Any]:
     fs = make_fs(scenario, uds_sock)
     info = fs.info(path)
@@ -222,6 +376,9 @@ def run_part2_random_read(
     latencies_ms: list[float] = []
     total_bytes = 0
     with fs.open(path, "rb") as f:
+        sampler = ProcessResourceSampler(
+            client_pids=[os.getpid()], sidecar_pid=sidecar_pid, interval_s=0.02
+        ).start()
         t_start = time.perf_counter()
         for off in offsets:
             t0 = time.perf_counter()
@@ -232,6 +389,7 @@ def run_part2_random_read(
                 raise RuntimeError(f"Short random read: got {len(chunk)}, expected {read_size}")
             total_bytes += len(chunk)
         wall_s = time.perf_counter() - t_start
+        resources = sampler.stop()
 
     s = sorted(latencies_ms)
     mb_s = (total_bytes / 1e6) / wall_s
@@ -247,11 +405,14 @@ def run_part2_random_read(
         "iops": round(iops, 2),
         "mb_s": round(mb_s, 2),
         "mib_s": round(mib_s, 2),
+        "resources": resources,
     }
     print(
         f"    Part 2 [1 MiB RandRead 50x] ({scenario}): p50={res['p50_ms']}ms, "
         f"p90={res['p90_ms']}ms, p99={res['p99_ms']}ms, IOPS={res['iops']}, "
-        f"{res['mb_s']} MB/s ({res['mib_s']} MiB/s)",
+        f"{res['mb_s']} MB/s ({res['mib_s']} MiB/s) | "
+        f"CPU={resources['avg_cpu_pct']}% ({resources['avg_cpu_cores']}c), "
+        f"RSS={resources['avg_rss_mib']}/{resources['peak_rss_mib']} MiB",
         flush=True,
     )
     return res
@@ -323,6 +484,7 @@ def run_part3_sequential(
     concurrency_spec: str,
     max_duration_secs: float = 120.0,
     chunk_size: int = 8 * 1024 * 1024,
+    sidecar_pid: int | None = None,
 ) -> dict[str, Any]:
     if concurrency_spec == "1":
         num_workers = 1
@@ -340,7 +502,7 @@ def run_part3_sequential(
     shards = [shard_path_for_worker(base_path, i, num_workers) for i in range(num_workers)]
 
     if mode == "thread":
-        barrier = threading.Barrier(num_workers)
+        barrier = threading.Barrier(num_workers + 1)
         with ThreadPoolExecutor(max_workers=num_workers) as ex:
             futs = [
                 ex.submit(
@@ -354,10 +516,15 @@ def run_part3_sequential(
                 )
                 for i in range(num_workers)
             ]
+            barrier.wait()
+            sampler = ProcessResourceSampler(
+                client_pids=[os.getpid()], sidecar_pid=sidecar_pid, interval_s=0.05
+            ).start()
             results = [fut.result() for fut in futs]
+            resources = sampler.stop()
     else:
         ctx = mp.get_context("spawn")
-        barrier = ctx.Barrier(num_workers)
+        barrier = ctx.Barrier(num_workers + 1)
         tasks = [
             (scenario, shards[i], uds_sock, chunk_size, max_duration_secs)
             for i in range(num_workers)
@@ -365,7 +532,18 @@ def run_part3_sequential(
         with ctx.Pool(
             processes=num_workers, initializer=_init_mp_pool, initargs=(barrier,)
         ) as pool:
-            results = pool.map(_mp_pool_task, tasks)
+            worker_pids = [
+                p.pid for p in getattr(pool, "_pool", []) if getattr(p, "pid", None) is not None
+            ]
+            async_res = pool.map_async(_mp_pool_task, tasks)
+            barrier.wait()
+            sampler = ProcessResourceSampler(
+                client_pids=[os.getpid()] + worker_pids,
+                sidecar_pid=sidecar_pid,
+                interval_s=0.05,
+            ).start()
+            results = async_res.get()
+            resources = sampler.stop()
 
     total_bytes = sum(r[0] for r in results)
     wall_s = max(r[1] for r in results)
@@ -393,13 +571,16 @@ def run_part3_sequential(
         "chunk_p90_ms": round(percentile(all_lats, 90.0), 2),
         "mb_s": round(mb_s, 2),
         "mib_s": round(mib_s, 2),
+        "resources": resources,
     }
-    cap_note = " [TIME-CAPPED @ 120s]" if capped else ""
+    cap_note = f" [TIME-CAPPED @ {max_duration_secs:g}s]" if capped else ""
     print(
         f"    Part 3 [SeqRead {concurrency_spec}] ({scenario}): "
         f"{res['total_gib']}/{res['target_gib']} GiB in {res['wall_s']}s -> "
         f"{res['mb_s']} MB/s ({res['mib_s']} MiB/s), "
-        f"chunk p50={res['chunk_p50_ms']}ms, p90={res['chunk_p90_ms']}ms{cap_note}",
+        f"chunk p50={res['chunk_p50_ms']}ms, p90={res['chunk_p90_ms']}ms | "
+        f"CPU={resources['avg_cpu_pct']}% ({resources['avg_cpu_cores']}c), "
+        f"RSS={resources['avg_rss_mib']}/{resources['peak_rss_mib']} MiB{cap_note}",
         flush=True,
     )
     return res
@@ -412,6 +593,7 @@ def run_part4_write(
     write_size_mb: int = 200,
     chunk_size: int = 8 * 1024 * 1024,
     iterations: int = 5,
+    sidecar_pid: int | None = None,
 ) -> dict[str, Any]:
     fs = make_fs(scenario, uds_sock)
     write_path = (
@@ -426,6 +608,9 @@ def run_part4_write(
         for offset in range(0, total_bytes, chunk_size)
     ]
 
+    stream_sampler = ProcessResourceSampler(
+        client_pids=[os.getpid()], sidecar_pid=sidecar_pid, interval_s=0.02
+    ).start()
     stream_times: list[float] = []
     for _ in range(iterations):
         t0 = time.perf_counter()
@@ -433,14 +618,19 @@ def run_part4_write(
             for ch in chunks:
                 wf.write(ch)
         stream_times.append(time.perf_counter() - t0)
+    stream_resources = stream_sampler.stop()
 
+    pipe_sampler = ProcessResourceSampler(
+        client_pids=[os.getpid()], sidecar_pid=sidecar_pid, interval_s=0.02
+    ).start()
     pipe_times: list[float] = []
     for _ in range(iterations):
         t0 = time.perf_counter()
         fs.pipe_file(write_path, payload)
         pipe_times.append(time.perf_counter() - t0)
+    pipe_resources = pipe_sampler.stop()
 
-    def _summarize(times: list[float]) -> dict[str, Any]:
+    def _summarize(times: list[float], resources: dict[str, float]) -> dict[str, Any]:
         s = sorted(times)
         p50_s = percentile(s, 50.0)
         return {
@@ -450,19 +640,20 @@ def run_part4_write(
             "p90_s": round(percentile(s, 90.0), 3),
             "mb_s_p50": round((total_bytes / 1e6) / p50_s, 2),
             "mib_s_p50": round((total_bytes / (1024.0 * 1024.0)) / p50_s, 2),
+            "resources": resources,
         }
 
     res = {
         "write_size_mib": write_size_mb,
-        "streaming_write": _summarize(stream_times),
-        "pipe_file": _summarize(pipe_times),
+        "streaming_write": _summarize(stream_times, stream_resources),
+        "pipe_file": _summarize(pipe_times, pipe_resources),
     }
     sw = res["streaming_write"]
     pf = res["pipe_file"]
     print(
         f"    Part 4 [200 MiB Write 5x] ({scenario}): "
-        f"stream p50={sw['p50_s']}s ({sw['mb_s_p50']} MB/s) | "
-        f"pipe_file p50={pf['p50_s']}s ({pf['mb_s_p50']} MB/s)",
+        f"stream p50={sw['p50_s']}s ({sw['mb_s_p50']} MB/s, CPU={stream_resources['avg_cpu_pct']}%, RSS={stream_resources['peak_rss_mib']} MiB) | "
+        f"pipe_file p50={pf['p50_s']}s ({pf['mb_s_p50']} MB/s, CPU={pipe_resources['avg_cpu_pct']}%, RSS={pipe_resources['peak_rss_mib']} MiB)",
         flush=True,
     )
     return res
@@ -506,6 +697,11 @@ def main() -> None:
         default="benchmarks/results_four_stacks_20gb.json",
         help="Path to write JSON results",
     )
+    parser.add_argument(
+        "--resource-only",
+        action="store_true",
+        help="Only merge measured `resources` into existing JSON entries without overwriting full-run timing",
+    )
     args = parser.parse_args()
 
     scenarios = [s.strip() for s in args.scenarios.split(",") if s.strip()]
@@ -528,15 +724,25 @@ def main() -> None:
         with open(args.json_out, "w", encoding="utf-8") as f:
             json.dump(all_results, f, indent=2)
 
+    def _sidecar_pid_for(sc: str) -> int | None:
+        if sc in ("s3_uds_grpc_aio", "s4_pyo3_remotefs") and sidecar.proc is not None:
+            return sidecar.proc.pid
+        return None
+
     try:
         if 1 in parts:
             print("\n=== PART 1: Single-Worker Uncached info() Latency (30 iterations) ===", flush=True)
             if needs_sidecar:
                 sidecar.start(readahead=False)
             for sc in scenarios:
-                all_results.setdefault(sc, {})["part1_info"] = run_part1_info(
-                    sc, args.path, args.uds_sock
+                r1 = run_part1_info(
+                    sc, args.path, args.uds_sock, sidecar_pid=_sidecar_pid_for(sc)
                 )
+                sc_dict = all_results.setdefault(sc, {})
+                if args.resource_only and "part1_info" in sc_dict:
+                    sc_dict["part1_info"]["resources"] = r1["resources"]
+                else:
+                    sc_dict["part1_info"] = r1
                 _save()
 
         if any(p in parts for p in (2, 3, 4)) and needs_sidecar:
@@ -545,9 +751,14 @@ def main() -> None:
         if 2 in parts:
             print("\n=== PART 2: Single-Worker 1 MiB Random Read (50 reads) ===", flush=True)
             for sc in scenarios:
-                all_results.setdefault(sc, {})["part2_random_read"] = run_part2_random_read(
-                    sc, args.path, args.uds_sock
+                r2 = run_part2_random_read(
+                    sc, args.path, args.uds_sock, sidecar_pid=_sidecar_pid_for(sc)
                 )
+                sc_dict = all_results.setdefault(sc, {})
+                if args.resource_only and "part2_random_read" in sc_dict:
+                    sc_dict["part2_random_read"]["resources"] = r2["resources"]
+                else:
+                    sc_dict["part2_random_read"] = r2
                 _save()
 
         if 3 in parts:
@@ -558,21 +769,32 @@ def main() -> None:
             for sc in scenarios:
                 sc_p3 = all_results.setdefault(sc, {}).setdefault("part3_sequential", {})
                 for conc in concurrencies:
-                    sc_p3[conc] = run_part3_sequential(
+                    r3 = run_part3_sequential(
                         sc,
                         args.path,
                         args.uds_sock,
                         conc,
                         max_duration_secs=args.max_duration_secs,
+                        sidecar_pid=_sidecar_pid_for(sc),
                     )
+                    if args.resource_only and conc in sc_p3:
+                        sc_p3[conc]["resources"] = r3["resources"]
+                    else:
+                        sc_p3[conc] = r3
                     _save()
 
         if 4 in parts:
             print("\n=== PART 4: Single-Worker 200 MiB Write (5 iterations) ===", flush=True)
             for sc in scenarios:
-                all_results.setdefault(sc, {})["part4_write"] = run_part4_write(
-                    sc, args.path, args.uds_sock
+                r4 = run_part4_write(
+                    sc, args.path, args.uds_sock, sidecar_pid=_sidecar_pid_for(sc)
                 )
+                sc_dict = all_results.setdefault(sc, {})
+                if args.resource_only and "part4_write" in sc_dict:
+                    sc_dict["part4_write"]["streaming_write"]["resources"] = r4["streaming_write"]["resources"]
+                    sc_dict["part4_write"]["pipe_file"]["resources"] = r4["pipe_file"]["resources"]
+                else:
+                    sc_dict["part4_write"] = r4
                 _save()
     finally:
         sidecar.stop()
