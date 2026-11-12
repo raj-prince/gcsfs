@@ -458,16 +458,24 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         endpoint_url=None,
         default_location=None,
         version_aware=False,
+        use_rust_fs=False,
+        rust_transport="grpc",
+        rust_uds_path=None,
+        use_uds_grpc=False,
+        uds_socket_path=None,
         **kwargs,
     ):
         if cache_timeout is not None:
             kwargs["listings_expiry_time"] = cache_timeout
+        bypass_async_loop = bool(use_rust_fs or use_uds_grpc)
         super().__init__(
             self,
-            asynchronous=asynchronous,
+            asynchronous=True if bypass_async_loop else asynchronous,
             loop=loop,
             **kwargs,
         )
+        if bypass_async_loop:
+            self.asynchronous = asynchronous
         if access not in self.scopes:
             raise ValueError(f"access must be one of {self.scopes}")
         if project is None:
@@ -476,7 +484,11 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             self.default_block_size = block_size
         self.requester_pays = requester_pays
         self.consistency = consistency
-        self.cache_timeout = cache_timeout or kwargs.pop("listings_expiry_time", None)
+        self.cache_timeout = (
+            cache_timeout
+            if cache_timeout is not None
+            else kwargs.pop("listings_expiry_time", None)
+        )
         self.requests_timeout = requests_timeout
         self.timeout = timeout
         self._session = None
@@ -484,6 +496,19 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         self.session_kwargs = session_kwargs or {}
         self.default_location = default_location
         self.version_aware = version_aware
+        self.use_rust_fs = bool(
+            use_rust_fs or os.environ.get("GCSFS_USE_RUST_FS", "0") == "1"
+        )
+        self.rust_transport = rust_transport
+        self.rust_uds_path = (
+            rust_uds_path or os.environ.get("GCSFS_RUST_UDS_PATH") or None
+        )
+        self.use_uds_grpc = bool(
+            use_uds_grpc or os.environ.get("GCSFS_USE_UDS_GRPC", "0") == "1"
+        )
+        self.uds_socket_path = (
+            uds_socket_path or os.environ.get("GCSFS_UDS_SOCKET_PATH") or None
+        )
         self._use_client_cert = _use_client_cert()
         self._use_mtls_endpoint = self._use_client_cert and _use_mtls_endpoint()
         self._ssl_context_task = None
@@ -498,6 +523,10 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             project, access, token, on_google=self.on_google
         )
         bind_gcs_sync_methods(self)
+        if self.use_rust_fs or self.use_uds_grpc:
+            self.info = self._direct_info_sync
+            self.cat_file = self._direct_cat_file_sync
+            self.pipe_file = self._direct_pipe_file_sync
 
     @property
     def _location(self):
@@ -1269,6 +1298,15 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
                 "type": "directory",
             }
 
+        if self.use_rust_fs:
+            from .rust_backend import rust_info
+
+            return await rust_info(self, path, generation=generation)
+        if self.use_uds_grpc:
+            from .uds_grpc_backend import uds_info_sync
+
+            return uds_info_sync(self, path, generation=generation)
+
         async with parallel_tasks_first_completed(
             [
                 self._get_object(path),
@@ -1284,6 +1322,38 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
             except FileNotFoundError:
                 pass
             return await get_directory_info_task
+
+    def _direct_info_sync(self, path, generation=None, **kwargs):
+        if (self.use_rust_fs or self.use_uds_grpc) and not self.asynchronous:
+            stripped = self._strip_protocol(path).rstrip("/")
+            if "/" in stripped:
+                parent_path = self._parent(stripped)
+                parent_cache = self._ls_from_cache(parent_path)
+                bucket, key, path_generation = self.split_path(stripped)
+                resolved_gen = _coalesce_generation(generation, path_generation)
+                if parent_cache:
+                    name = "/".join((bucket, key))
+                    for o in parent_cache:
+                        if o["name"].rstrip("/") == name and (
+                            not resolved_gen or o.get("generation") == resolved_gen
+                        ):
+                            return o
+                if self._ls_from_cache(stripped):
+                    return {
+                        "bucket": bucket,
+                        "name": stripped,
+                        "size": 0,
+                        "storageClass": "DIRECTORY",
+                        "type": "directory",
+                    }
+                if self.use_rust_fs:
+                    from .rust_backend import rust_info_sync
+
+                    return rust_info_sync(self, stripped, generation=resolved_gen)
+                from .uds_grpc_backend import uds_info_sync
+
+                return uds_info_sync(self, stripped, generation=resolved_gen)
+        return asyn.sync(self.loop, self._info, path, generation=generation, **kwargs)
 
     async def _get_directory_info(self, path, bucket, key, generation):
         """
@@ -1367,6 +1437,19 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         if is_empty_range(start, end):
             return b""
 
+        if self.use_rust_fs:
+            from .rust_backend import rust_cat_file
+
+            return await rust_cat_file(
+                self, path, start=start, end=end, generation=kwargs.get("generation")
+            )
+        if self.use_uds_grpc:
+            from .uds_grpc_backend import uds_cat_file_sync
+
+            return uds_cat_file_sync(
+                self, path, start=start, end=end, generation=kwargs.get("generation")
+            )
+
         u2 = self.url(path, generation=kwargs.get("generation"))
         if start is not None or end is not None:
             head = {"Range": await self._process_limits(path, start, end)}
@@ -1428,6 +1511,29 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         # to keep it separate because concurrency code path is still in an experimental phase.
         # Once concurrency code path is stabilized, we can remove this if-else condition.
         return await self._cat_file_sequential(path, start=start, end=end, **kwargs)
+
+    def _direct_cat_file_sync(self, path, start=None, end=None, **kwargs):
+        if (
+            (self.use_rust_fs or self.use_uds_grpc)
+            and not self.asynchronous
+            and kwargs.get("concurrency", 1) == 1
+        ):
+            if is_empty_range(start, end):
+                return b""
+            if self.use_rust_fs:
+                from .rust_backend import rust_cat_file_sync
+
+                return rust_cat_file_sync(
+                    self, path, start=start, end=end, generation=kwargs.get("generation")
+                )
+            from .uds_grpc_backend import uds_cat_file_sync
+
+            return uds_cat_file_sync(
+                self, path, start=start, end=end, generation=kwargs.get("generation")
+            )
+        return asyn.sync(
+            self.loop, self._cat_file, path, start=start, end=end, **kwargs
+        )
 
     async def _getxattr(self, path, attr):
         """Get user-defined metadata attribute"""
@@ -1835,6 +1941,22 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
         consistency = consistency or self.consistency
         bucket, key, generation = self.split_path(path)
         if_generation_match = _resolve_generation_match(mode, if_generation_match)
+        if self.use_rust_fs:
+            from .rust_backend import rust_pipe_file
+
+            out = await rust_pipe_file(
+                self,
+                path,
+                data,
+                content_type=content_type,
+                metadata=metadata,
+                consistency=consistency,
+                mode=mode,
+                if_generation_match=if_generation_match,
+                block_size=chunksize,
+            )
+            await self._write_file_cache_update(path)
+            return out
         size = len(data)
         out = None
         if size < chunksize:
@@ -1879,6 +2001,47 @@ class GCSFileSystem(DirCacheUpdater, asyn.AsyncFileSystem):
 
         await self._write_file_cache_update(path)
         return location
+
+    def _direct_pipe_file_sync(self, path, value, **kwargs):
+        if (self.use_rust_fs or self.use_uds_grpc) and not self.asynchronous:
+            consistency = kwargs.get("consistency") or self.consistency
+            mode = kwargs.get("mode", "overwrite")
+            if_generation_match = _resolve_generation_match(
+                mode, kwargs.get("if_generation_match")
+            )
+            if self.use_rust_fs:
+                from .rust_backend import rust_pipe_file_sync
+
+                out = rust_pipe_file_sync(
+                    self,
+                    path,
+                    value,
+                    content_type=kwargs.get("content_type", "application/octet-stream"),
+                    metadata=kwargs.get("metadata"),
+                    consistency=consistency,
+                    mode=mode,
+                    if_generation_match=if_generation_match,
+                    block_size=kwargs.get("chunksize", 50 * 2**20),
+                )
+            else:
+                from .uds_grpc_backend import uds_pipe_file_sync
+
+                uds_pipe_file_sync(
+                    self,
+                    path,
+                    value,
+                    content_type=kwargs.get("content_type", "application/octet-stream"),
+                    metadata=kwargs.get("metadata"),
+                    mode=(
+                        "create"
+                        if (mode == "create" or if_generation_match == 0)
+                        else "overwrite"
+                    ),
+                )
+                out = {"size": len(value), "generation": None}
+            self.invalidate_cache(self._parent(path))
+            return out
+        return asyn.sync(self.loop, self._pipe_file, path, value, **kwargs)
 
     async def _put_file(
         self,
@@ -2680,19 +2843,37 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
             mode, if_generation_match
         )
         self.concurrency = kwargs.get("concurrency", DEFAULT_CONCURRENCY)
-        self.cache_type, self.cache_source = _get_prefetcher_and_cache_config(
-            cache_type
+        use_direct_backend = (
+            getattr(gcsfs, "use_rust_fs", False) is True
+            or getattr(gcsfs, "use_uds_grpc", False) is True
         )
-        cache_options = dict(cache_options or {})
-        if self.cache_type == "adaptive":
-            if "concurrency" not in cache_options:
-                cache_options["concurrency"] = self.concurrency
-            if "max_prefetch_size" not in cache_options:
-                cache_options["max_prefetch_size"] = kwargs.pop(
-                    "max_prefetch_size", MAX_PREFETCH_SIZE
-                )
-            else:
-                kwargs.pop("max_prefetch_size", None)
+        if use_direct_backend:
+            self.cache_type, self.cache_source = "none", "none"
+            kwargs.pop("max_prefetch_size", None)
+            cache_options = dict(cache_options or {})
+            fs_loop = None
+            has_usable_fs_loop = False
+        else:
+            self.cache_type, self.cache_source = _get_prefetcher_and_cache_config(
+                cache_type
+            )
+            cache_options = dict(cache_options or {})
+            if self.cache_type == "adaptive":
+                if "concurrency" not in cache_options:
+                    cache_options["concurrency"] = self.concurrency
+                if "max_prefetch_size" not in cache_options:
+                    cache_options["max_prefetch_size"] = kwargs.pop(
+                        "max_prefetch_size", MAX_PREFETCH_SIZE
+                    )
+                else:
+                    kwargs.pop("max_prefetch_size", None)
+
+            fs_loop = getattr(gcsfs, "loop", None)
+            has_usable_fs_loop = (
+                isinstance(fs_loop, asyncio.AbstractEventLoop)
+                and fs_loop.is_running()
+                and not fs_loop.is_closed()
+            )
         # Kept so that a pickled read handle reopens with the same cache options.
         self._reopen_cache_options = dict(cache_options)
 
@@ -2703,13 +2884,37 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         # will be overwritten to "wb" mode with a warning. Pop it before
         # super().__init__() so that it stays out of self.kwargs.
         _supports_append = kwargs.pop("_supports_append", False)
+        if "a" in mode and not _supports_append:
+            warnings.warn(
+                "Append mode 'a' is not supported in GCS. Using overwrite mode instead."
+            )
+            mode = mode.replace("a", "w")
 
-        fs_loop = getattr(gcsfs, "loop", None)
-        has_usable_fs_loop = (
-            isinstance(fs_loop, asyncio.AbstractEventLoop)
-            and fs_loop.is_running()
-            and not fs_loop.is_closed()
-        )
+        self._rust_file = None
+        preloaded_det = None
+        if use_direct_backend and "r" in mode:
+            if getattr(gcsfs, "use_rust_fs", False) is True:
+                from .rust_backend import rust_file_info, rust_open_file
+
+                self._rust_file = rust_open_file(
+                    gcsfs,
+                    path,
+                    mode="rb",
+                    generation=self.generation,
+                )
+                preloaded_det = rust_file_info(gcsfs, self._rust_file)
+            else:
+                from .uds_grpc_backend import UdsGrpcFile
+
+                self._rust_file = UdsGrpcFile(
+                    gcsfs,
+                    path,
+                    mode="rb",
+                    generation=self.generation,
+                )
+                preloaded_det = self._rust_file.info()
+            if preloaded_det is not None and "size" not in kwargs:
+                kwargs["size"] = preloaded_det["size"]
 
         super().__init__(
             gcsfs,
@@ -2721,6 +2926,8 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
             cache_options=cache_options,
             **kwargs,
         )
+        if preloaded_det is not None:
+            self._details = preloaded_det
         self.gcsfs = gcsfs
         self.bucket = bucket
         self.key = key
@@ -2770,12 +2977,6 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
                 # The prefetcher will instead be closed cleanly inside GCSFile._close_impl().
                 cache.close = lambda: None
 
-        if "a" in self.mode and not _supports_append:
-            warnings.warn(
-                "Append mode 'a' is not supported in GCS. Using overwrite mode instead."
-            )
-            self.mode = self.mode.replace("a", "w")
-
         if "r" in self.mode:
             det = self.details
         else:
@@ -2791,12 +2992,41 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         self.fixed_key_metadata.update(fixed_key_metadata or {})
         self.kms_key_name = kms_key_name
         self.timeout = timeout
-        _start_deferred_close_worker()
-        if mode in {"wb", "xb"}:
+        if not use_direct_backend:
+            _start_deferred_close_worker()
+        if self.mode in {"wb", "xb"}:
             if self.blocksize < GCS_MIN_BLOCK_SIZE:
                 warnings.warn("Setting block size to minimum value, 2**18")
                 self.blocksize = GCS_MIN_BLOCK_SIZE
             self.location = None
+            if use_direct_backend:
+                if getattr(gcsfs, "use_rust_fs", False) is True:
+                    from .rust_backend import rust_open_file
+
+                    self._rust_file = rust_open_file(
+                        gcsfs,
+                        self.path,
+                        mode=self.mode,
+                        content_type=self.content_type,
+                        metadata=self.metadata,
+                        block_size=self.blocksize,
+                        if_generation_match=self.if_generation_match,
+                    )
+                else:
+                    from .uds_grpc_backend import UdsGrpcFile
+
+                    self._rust_file = UdsGrpcFile(
+                        gcsfs,
+                        self.path,
+                        mode=(
+                            "xb"
+                            if (self.mode == "xb" or self.if_generation_match == 0)
+                            else "wb"
+                        ),
+                        content_type=self.content_type,
+                        metadata=self.metadata,
+                        block_size=self.blocksize,
+                    )
 
     def _reopen_kwargs(self):
         """Keyword arguments that reopen this file with the options it was opened with."""
@@ -2954,6 +3184,11 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
 
         Should only happen during discarding this write-mode file
         """
+        if getattr(self, "_rust_file", None) is not None:
+            self._rust_file = None
+            self.location = None
+            self.closed = True
+            return
         if self.location is None:
             return
         self.gcsfs.call("DELETE", _strip_generation_match(self.location))
@@ -2982,6 +3217,68 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         )
         self.generation = j.get("generation")
 
+    def read(self, length=-1):
+        if getattr(self, "_rust_file", None) is not None:
+            if self.mode != "rb":
+                raise ValueError("File not in read mode")
+            if self.closed:
+                raise ValueError("I/O operation on closed file.")
+            if length == 0:
+                return b""
+            req_len = None if (length is None or length < 0) else int(length)
+            out = self._rust_file.read(req_len)
+            self.loc += len(out)
+            return out
+        return super().read(length)
+
+    def seek(self, loc, whence=0):
+        if getattr(self, "_rust_file", None) is not None:
+            if self.mode != "rb":
+                raise ValueError("Seek only available in read mode")
+            if self.closed:
+                raise ValueError("I/O operation on closed file.")
+            new_pos = self._rust_file.seek(int(loc), int(whence))
+            self.loc = int(new_pos)
+            return self.loc
+        return super().seek(loc, whence)
+
+    def tell(self):
+        if getattr(self, "_rust_file", None) is not None:
+            if self.closed:
+                raise ValueError("I/O operation on closed file.")
+            return int(self._rust_file.tell())
+        return super().tell()
+
+    def write(self, data):
+        if getattr(self, "_rust_file", None) is not None:
+            if self.mode not in {"wb", "xb"}:
+                raise ValueError("File not in write mode")
+            if self.closed:
+                raise ValueError("I/O operation on closed file.")
+            if self.forced:
+                raise ValueError("This file has been force-flushed, can only close")
+            if not isinstance(data, (bytes, bytearray)):
+                data = bytes(data)
+            written = self._rust_file.write(data)
+            self.checker.update(memoryview(data))
+            self.loc += written
+            self.offset = (self.offset or 0) + written
+            return written
+        return super().write(data)
+
+    def flush(self, force=False):
+        if getattr(self, "_rust_file", None) is not None:
+            if self.closed:
+                raise ValueError("Flush on closed file")
+            if force and self.forced:
+                raise ValueError("Force flush cannot be called more than once")
+            if force:
+                self.forced = True
+            if self.mode in {"wb", "xb"}:
+                self._rust_file.flush()
+            return
+        return super().flush(force=force)
+
     def _fetch_range(self, start=None, end=None):
         """Get data from GCS
 
@@ -2990,6 +3287,10 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         """
         if is_empty_range(start, end, self.size):
             return b""
+        if getattr(self, "_rust_file", None) is not None and hasattr(
+            self._rust_file, "read_range"
+        ):
+            return self._rust_file.read_range(start, end)
         try:
             return self.fs.cat_file(
                 self.path,
@@ -3023,7 +3324,9 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
             self.closed = True
             return
 
-        if _on_loop_thread(getattr(getattr(self, "gcsfs", None), "loop", None)):
+        if getattr(self, "_rust_file", None) is None and _on_loop_thread(
+            getattr(getattr(self, "gcsfs", None), "_loop", None)
+        ):
             self._close_deferred = True
             _defer_close(self)
             return
@@ -3031,6 +3334,17 @@ class GCSFile(fsspec.spec.AbstractBufferedFile):
         self._close_impl()
 
     def _close_impl(self):
+        rust_file = getattr(self, "_rust_file", None)
+        if rust_file is not None:
+            try:
+                rust_file.close()
+            finally:
+                self._rust_file = None
+                self.forced = True
+                self.closed = True
+            if self.mode in {"wb", "xb"} and self.autocommit:
+                self.gcsfs.invalidate_cache(self.path)
+            return
         # TODO: Remove explicit prefetcher cleanup once fsspec handles deferred cache teardown.
         cache = getattr(self, "cache", None)
         prefetcher = getattr(cache, "_prefetcher", None)
@@ -3268,6 +3582,24 @@ async def simple_upload(
     Performs a simple, single-request upload. This function has a conditional path to support
     experimental features for Zonal and RCU buckets to upload data using gRPC.
     """
+    if getattr(fs, "use_rust_fs", False) is True:
+        from .rust_backend import rust_pipe_file
+
+        path = f"{bucket}/{key}"
+        if_generation_match = _resolve_generation_match(mode, if_generation_match)
+        res = await rust_pipe_file(
+            fs,
+            path,
+            datain,
+            content_type=content_type,
+            metadata=metadatain,
+            consistency=consistency,
+            mode=mode,
+            if_generation_match=if_generation_match,
+        )
+        await fs._write_file_cache_update(path)
+        return res
+
     from .extended_gcsfs import ExtendedGcsFileSystem
     from .extended_gcsfs import simple_upload as ext_simple_upload
 
